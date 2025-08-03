@@ -10,8 +10,12 @@ def main():
         print("❌ No URL provided")
         return
     
+    # Ask about headless mode
+    headless_choice = input("\nRun in background (invisible browser)? (y/n): ").strip().lower()
+    headless = headless_choice == 'y'
+    
     # Create scraper instance
-    scraper = IntelligentYouTubeBoatScraper(youtube_url)
+    scraper = IntelligentYouTubeBoatScraper(youtube_url, headless=headless)
     
     try:
         # Initialize YOLO model

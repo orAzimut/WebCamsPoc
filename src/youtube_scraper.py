@@ -22,8 +22,9 @@ from yolo_detector import YOLOBoatDetector
 class IntelligentYouTubeBoatScraper:
     """Main scraper class with YOLO tracking-based boat detection"""
     
-    def __init__(self, youtube_url):
+    def __init__(self, youtube_url, headless=False):
         self.url = youtube_url
+        self.headless = headless
         self.base_dir = r"C:\Users\OrGil.AzureAD\OneDrive - AMPC\Desktop\Azimut.ai\webScrape\webCams\POC"
         
         # Keep run timestamp for metadata but don't use for folder structure
@@ -55,10 +56,17 @@ class IntelligentYouTubeBoatScraper:
     def setup_driver(self):
         """Setup Chrome driver optimized for speed"""
         try:
-            print("⚡ Setting up Chrome driver (optimized)...")
+            mode_text = "headless" if self.headless else "visible"
+            print(f"⚡ Setting up Chrome driver ({mode_text} mode)...")
             start_time = time.time()
             
             chrome_options = Options()
+            
+            # Headless mode option
+            if self.headless:
+                chrome_options.add_argument("--headless")
+                chrome_options.add_argument("--disable-gpu")
+                print("👻 Running in headless mode (invisible browser)")
             
             # Essential options only
             chrome_options.add_argument("--disable-blink-features=AutomationControlled")
