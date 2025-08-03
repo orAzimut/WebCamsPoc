@@ -17,6 +17,243 @@ from ultralytics import YOLO
 import math
 from collections import defaultdict
 
+# Import required packages for SORT and CV methods
+try:
+    from skimage.metrics import structural_similarity as ssim
+    from scipy.spatial.distance import cosine
+    from filterpy.kalman import KalmanFilter
+    import lap
+except ImportError as e:
+    print(f"⚠ Missing package: {e}")
+    print("Please install: pip install scikit-image scipy filterpy lap")
+    exit(1)
+
+# Simple SORT Tracker Implementation
+class KalmanBoxTracker(object):
+    """
+    This class represents the internal state of individual tracked objects observed as bbox.
+    """
+    count = 0
+
+    def __init__(self, bbox):
+        """
+        Initialises a tracker using initial bounding box.
+        """
+        # define constant velocity model
+        try:
+            from filterpy.kalman import KalmanFilter
+        except ImportError:
+            print("Error: filterpy not installed. Run: pip install filterpy")
+            raise
+            
+        self.kf = KalmanFilter(dim_x=7, dim_z=4)
+        self.kf.F = np.array([[1,0,0,0,1,0,0],[0,1,0,0,0,1,0],[0,0,1,0,0,0,1],[0,0,0,1,0,0,0],[0,0,0,0,1,0,0],[0,0,0,0,0,1,0],[0,0,0,0,0,0,1]])
+        self.kf.H = np.array([[1,0,0,0,0,0,0],[0,1,0,0,0,0,0],[0,0,1,0,0,0,0],[0,0,0,1,0,0,0]])
+
+        self.kf.R[2:,2:] *= 10.
+        self.kf.P[4:,4:] *= 1000. # give high uncertainty to the unobservable initial velocities
+        self.kf.P *= 10.
+        self.kf.Q[-1,-1] *= 0.01
+        self.kf.Q[4:,4:] *= 0.01
+
+        self.kf.x[:4] = self.convert_bbox_to_z(bbox)
+        self.time_since_update = 0
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+        self.history = []
+        self.hits = 0
+        self.hit_streak = 0
+        self.age = 0
+
+    def update(self, bbox):
+        """
+        Updates the state vector with observed bbox.
+        """
+        self.time_since_update = 0
+        self.history = []
+        self.hits += 1
+        self.hit_streak += 1
+        self.kf.update(self.convert_bbox_to_z(bbox))
+
+    def predict(self):
+        """
+        Advances the state vector and returns the predicted bounding box estimate.
+        """
+        if((self.kf.x[6]+self.kf.x[2])<=0):
+            self.kf.x[6] *= 0.0
+        self.kf.predict()
+        self.age += 1
+        if(self.time_since_update>0):
+            self.hit_streak = 0
+        self.time_since_update += 1
+        self.history.append(self.convert_x_to_bbox(self.kf.x))
+        return self.history[-1]
+
+    def get_state(self):
+        """
+        Returns the current bounding box estimate.
+        """
+        return self.convert_x_to_bbox(self.kf.x)
+
+    @staticmethod
+    def convert_bbox_to_z(bbox):
+        """
+        Takes a bounding box in the form [x1,y1,x2,y2] and returns z in the form
+        [x,y,s,r] where x,y is the centre of the box and s is the scale/area and r is
+        the aspect ratio
+        """
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        x = bbox[0] + w/2.
+        y = bbox[1] + h/2.
+        s = w * h    #scale is just area
+        r = w / float(h)
+        return np.array([x, y, s, r]).reshape((4, 1))
+
+    @staticmethod
+    def convert_x_to_bbox(x, score=None):
+        """
+        Takes a bounding box in the centre form [x,y,s,r] and returns it in the form
+        [x1,y1,x2,y2] where x1,y1 is the top left and x2,y2 is the bottom right
+        """
+        w = np.sqrt(x[2] * x[3])
+        h = x[2] / w
+        if(score==None):
+            return np.array([x[0]-w/2.,x[1]-h/2.,x[0]+w/2.,x[1]+h/2.]).reshape((1,4))
+        else:
+            return np.array([x[0]-w/2.,x[1]-h/2.,x[0]+w/2.,x[1]+h/2.,score]).reshape((1,5))
+
+
+def linear_assignment(cost_matrix):
+    try:
+        import lap
+        _, x, y = lap.lapjv(cost_matrix, extend_cost=True)
+        return np.array([[y[i],i] for i in x if i >= 0])
+    except ImportError:
+        from scipy.optimize import linear_sum_assignment
+        x, y = linear_sum_assignment(cost_matrix)
+        return np.array(list(zip(x, y)))
+
+
+def iou_batch(bb_test, bb_gt):
+    """
+    From SORT: Computes IOU between two bboxes in the form [x1,y1,x2,y2]
+    """
+    bb_gt = np.expand_dims(bb_gt, 0)
+    bb_test = np.expand_dims(bb_test, 1)
+    
+    xx1 = np.maximum(bb_test[..., 0], bb_gt[..., 0])
+    yy1 = np.maximum(bb_test[..., 1], bb_gt[..., 1])
+    xx2 = np.minimum(bb_test[..., 2], bb_gt[..., 2])
+    yy2 = np.minimum(bb_test[..., 3], bb_gt[..., 3])
+    w = np.maximum(0., xx2 - xx1)
+    h = np.maximum(0., yy2 - yy1)
+    wh = w * h
+    o = wh / ((bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1])                                      
+        + (bb_gt[..., 2] - bb_gt[..., 0]) * (bb_gt[..., 3] - bb_gt[..., 1]) - wh)                                              
+    return(o)  
+
+
+def associate_detections_to_trackers(detections, trackers, iou_threshold = 0.3):
+    """
+    Assigns detections to tracked object (both represented as bounding boxes)
+    Returns 3 lists of matches, unmatched_detections and unmatched_trackers
+    """
+    if(len(trackers)==0):
+        return np.empty((0,2),dtype=int), np.arange(len(detections)), np.empty((0,5),dtype=int)
+
+    iou_matrix = iou_batch(detections, trackers)
+
+    if min(iou_matrix.shape) > 0:
+        a = (iou_matrix > iou_threshold).astype(np.int32)
+        if a.sum(1).max() == 1 and a.sum(0).max() == 1:
+            matched_indices = np.stack(np.where(a), axis=1)
+        else:
+            matched_indices = linear_assignment(-iou_matrix)
+    else:
+        matched_indices = np.empty(shape=(0,2))
+
+    unmatched_detections = []
+    for d, det in enumerate(detections):
+        if(d not in matched_indices[:,0]):
+            unmatched_detections.append(d)
+    unmatched_trackers = []
+    for t, trk in enumerate(trackers):
+        if(t not in matched_indices[:,1]):
+            unmatched_trackers.append(t)
+
+    #filter out matched with low IOU
+    matches = []
+    for m in matched_indices:
+        if(iou_matrix[m[0], m[1]]<iou_threshold):
+            unmatched_detections.append(m[0])
+            unmatched_trackers.append(m[1])
+        else:
+            matches.append(m.reshape(1,2))
+    if(len(matches)==0):
+        matches = np.empty((0,2),dtype=int)
+    else:
+        matches = np.concatenate(matches,axis=0)
+
+    return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
+
+
+class Sort(object):
+    def __init__(self, max_age=1, min_hits=3, iou_threshold=0.3):
+        """
+        Sets key parameters for SORT
+        """
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.trackers = []
+        self.frame_count = 0
+
+    def update(self, dets=np.empty((0, 5))):
+        """
+        Params:
+          dets - a numpy array of detections in the format [[x1,y1,x2,y2,score],[x1,y1,x2,y2,score],...]
+        Requires: this method must be called once for each frame even with empty detections (use np.empty((0, 5)) for frames without detections).
+        Returns the a similar array, where the last column is the object ID.
+
+        NOTE: The number of objects returned may differ from the number of detections provided.
+        """
+        self.frame_count += 1
+        # get predicted locations from existing trackers.
+        trks = np.zeros((len(self.trackers), 5))
+        to_del = []
+        ret = []
+        for t, trk in enumerate(trks):
+            pos = self.trackers[t].predict()[0]
+            trk[:] = [pos[0], pos[1], pos[2], pos[3], 0]
+            if np.any(np.isnan(pos)):
+                to_del.append(t)
+        trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
+        for t in reversed(to_del):
+            self.trackers.pop(t)
+        matched, unmatched_dets, unmatched_trks = associate_detections_to_trackers(dets, trks, self.iou_threshold)
+
+        # update matched trackers with assigned detections
+        for m in matched:
+            self.trackers[m[1]].update(dets[m[0], :])
+
+        # create and initialise new trackers for unmatched detections
+        for i in unmatched_dets:
+            trk = KalmanBoxTracker(dets[i,:])
+            self.trackers.append(trk)
+        i = len(self.trackers)
+        for trk in reversed(self.trackers):
+            d = trk.get_state()[0]
+            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+                ret.append(np.concatenate((d,[trk.id+1])).reshape(1,-1)) # +1 as MOT benchmark requires positive
+            i -= 1
+            # remove dead tracklet
+            if(trk.time_since_update > self.max_age):
+                self.trackers.pop(i)
+        if(len(ret)>0):
+            return np.concatenate(ret)
+        return np.empty((0,5))
+
 class BoatTracker:
     """Tracks individual boats and manages diversity scoring"""
     
@@ -63,7 +300,7 @@ class BoatTracker:
             'distance': distance,
             'size_ratio': size_ratio
         }
-    
+
     def should_save_image(self, new_bbox, current_time):
         """Determine if we should save this detection"""
         
@@ -120,7 +357,14 @@ class YOLOBoatDetector:
         try:
             print("🔥 Loading YOLO11 model...")
             # Load YOLOv11 model (will download automatically if not present)
-            self.model = YOLO('yolo11n.pt')  # Use nano version for speed, change to 'yolo11s.pt' or 'yolo11m.pt' for better accuracy
+            self.model = YOLO('yolo11n.pt')
+            # Force GPU if available:
+            import torch
+            if torch.cuda.is_available():
+                self.model.to('cuda')
+                print("✓ Using GPU acceleration")
+            else:
+                print("⚠ Using CPU (slower)")  # Use nano version for speed, change to 'yolo11s.pt' or 'yolo11m.pt' for better accuracy
             print("✓ YOLO11 model loaded successfully")
             return True
         except Exception as e:
@@ -331,7 +575,427 @@ class LocationExtractor:
             print(f"✗ Error extracting location: {e}")
             self.location = "Unknown"
             return self.location
+class BoatAngleDetector:
+    """Detects if boat angle/appearance has changed significantly using CV methods"""
+    
+    def __init__(self):
+        self.similarity_threshold = 0.9  # SSIM threshold for "same angle"
+        self.histogram_threshold = 0.8   # Histogram correlation threshold
+        
+    def extract_boat_region(self, frame, bbox):
+        """Extract boat region from frame using bounding box"""
+        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = max(0, int(x1)), max(0, int(y1)), int(x2), int(y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return None
+            
+        boat_region = frame[y1:y2, x1:x2]
+        
+        # Resize to standard size for comparison
+        if boat_region.size > 0:
+            boat_region = cv2.resize(boat_region, (64, 64))
+            return boat_region
+        return None
+    
+    def calculate_ssim_similarity(self, img1, img2):
+        """Calculate structural similarity between two images"""
+        try:
+            # Check if SSIM is available
+            from skimage.metrics import structural_similarity as ssim
+            
+            # Convert to grayscale if needed
+            if len(img1.shape) == 3:
+                img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+                img2_gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+            else:
+                img1_gray, img2_gray = img1, img2
+                
+            # Calculate SSIM
+            similarity = ssim(img1_gray, img2_gray)
+            return similarity
+        except ImportError:
+            # SSIM not available, return 0 to skip this metric
+            return 0.0
+        except Exception as e:
+            print(f"SSIM calculation error: {e}")
+            return 0.0
+    
+    def calculate_histogram_similarity(self, img1, img2):
+        """Calculate histogram correlation between two images"""
+        try:
+            # Calculate histograms for each channel
+            hist1 = cv2.calcHist([img1], [0, 1, 2], None, [32, 32, 32], [0, 256, 0, 256, 0, 256])
+            hist2 = cv2.calcHist([img2], [0, 1, 2], None, [32, 32, 32], [0, 256, 0, 256, 0, 256])
+            
+            # Normalize histograms
+            cv2.normalize(hist1, hist1)
+            cv2.normalize(hist2, hist2)
+            
+            # Calculate correlation
+            correlation = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+            return correlation
+        except Exception as e:
+            print(f"Histogram calculation error: {e}")
+            return 0.0
+    
+    def is_different_angle(self, current_frame, current_bbox, reference_frame, reference_bbox):
+        """
+        Determine if current detection shows boat at significantly different angle
+        Returns: (is_different, similarity_scores)
+        """
+        try:
+            # Extract boat regions
+            current_boat = self.extract_boat_region(current_frame, current_bbox)
+            reference_boat = self.extract_boat_region(reference_frame, reference_bbox)
+            
+            if current_boat is None or reference_boat is None:
+                return True, {"ssim": 0.0, "histogram": 0.0}  # Assume different if extraction fails
+            
+            # Calculate similarities
+            ssim_score = self.calculate_ssim_similarity(current_boat, reference_boat)
+            hist_score = self.calculate_histogram_similarity(current_boat, reference_boat)
+            
+            # Determine if angle is different (either metric below threshold)
+            is_different = (ssim_score < self.similarity_threshold or 
+                          hist_score < self.histogram_threshold)
+            
+            return is_different, {
+                "ssim": ssim_score,
+                "histogram": hist_score
+            }
+            
+        except Exception as e:
+            print(f"Angle detection error: {e}")
+            return True, {"ssim": 0.0, "histogram": 0.0}
+# Replace the SORTBoatTracker class with this improved version:
 
+class SORTBoatTracker:
+    """SORT-based boat tracking with intelligent ID reuse"""
+    
+    def __init__(self):
+        self.sort_tracker = Sort(max_age=15, min_hits=1, iou_threshold=0.3)  # Increased max_age
+        self.angle_detector = BoatAngleDetector()
+        self.boat_data = {}  # {track_id: boat_info}
+        self.recently_lost_boats = {}  # {track_id: {'last_bbox', 'lost_time', 'boat_data'}}
+        self.last_save_time = 0
+        self.save_interval = 5.0  # 5 seconds minimum between any saves
+        self.reuse_timeout = 30.0  # 30 seconds to reuse lost IDs
+        self.reuse_distance = 150  # Max pixels to consider for ID reuse
+        
+    def update_tracks(self, detections):
+        """Update SORT tracker with new detections and handle ID reuse"""
+        if not detections:
+            tracks = self.sort_tracker.update(np.empty((0, 5)))
+            # Clean up old lost boats
+            self.cleanup_lost_boats()
+            return []
+        
+        # Convert detections to SORT format: [x1, y1, x2, y2, confidence]
+        sort_detections = []
+        for det in detections:
+            bbox = det['bbox']
+            conf = det['confidence']
+            sort_detections.append([bbox[0], bbox[1], bbox[2], bbox[3], conf])
+        
+        sort_detections = np.array(sort_detections)
+        
+        # Update SORT tracker
+        tracks = self.sort_tracker.update(sort_detections)
+        
+        # Check for new tracks that might be reappearing boats
+        current_track_ids = set()
+        result_tracks = []
+        
+        for i, track in enumerate(tracks):
+            original_track_id = int(track[4])  # SORT's assigned ID
+            bbox = [int(track[0]), int(track[1]), int(track[2]), int(track[3])]
+            
+            # Check if this is a "new" track that might be a reappearing boat
+            reused_id = self.check_for_id_reuse(original_track_id, bbox)
+            final_track_id = reused_id if reused_id else original_track_id
+            
+            current_track_ids.add(final_track_id)
+            
+            # Find matching detection by bbox similarity
+            best_detection = None
+            best_iou = 0
+            for det in detections:
+                iou = self.calculate_iou(bbox, det['bbox'])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_detection = det
+            
+            if best_detection:
+                result_tracks.append({
+                    'track_id': final_track_id,
+                    'original_sort_id': original_track_id,
+                    'bbox': bbox,
+                    'confidence': best_detection['confidence'],
+                    'class': best_detection['class'],
+                    'is_new': final_track_id not in self.boat_data,
+                    'is_reused': reused_id is not None
+                })
+        
+        # Update lost boats tracking
+        self.update_lost_boats_tracking(current_track_ids)
+        
+        return result_tracks
+    
+    def check_for_id_reuse(self, new_track_id, new_bbox):
+        """Check if this new track should reuse a recently lost ID"""
+        import time
+        current_time = time.time()
+        
+        # Only check for truly new tracks (not in our boat_data)
+        if new_track_id in self.boat_data:
+            return None
+        
+        # Check recently lost boats
+        for lost_id, lost_info in list(self.recently_lost_boats.items()):
+            time_since_lost = current_time - lost_info['lost_time']
+            
+            # Skip if too much time has passed
+            if time_since_lost > self.reuse_timeout:
+                continue
+            
+            # Calculate distance between new detection and last known position
+            distance = self.calculate_bbox_distance(new_bbox, lost_info['last_bbox'])
+            
+            if distance < self.reuse_distance:
+                print(f"🔄 Reusing ID {lost_id} for new detection (distance: {distance:.1f}px, lost {time_since_lost:.1f}s ago)")
+                
+                # Restore the boat data
+                self.boat_data[lost_id] = lost_info['boat_data']
+                
+                # Remove from lost boats
+                del self.recently_lost_boats[lost_id]
+                
+                return lost_id
+        
+        return None
+    
+    def calculate_bbox_distance(self, bbox1, bbox2):
+        """Calculate distance between centers of two bounding boxes"""
+        center1 = ((bbox1[0] + bbox1[2]) / 2, (bbox1[1] + bbox1[3]) / 2)
+        center2 = ((bbox2[0] + bbox2[2]) / 2, (bbox2[1] + bbox2[3]) / 2)
+        
+        return ((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)**0.5
+    
+    def update_lost_boats_tracking(self, current_track_ids):
+        """Update tracking of lost boats"""
+        import time
+        current_time = time.time()
+        
+        # Move boats that are no longer tracked to recently_lost
+        for track_id in list(self.boat_data.keys()):
+            if track_id not in current_track_ids:
+                if track_id not in self.recently_lost_boats:
+                    print(f"📤 Boat {track_id} lost - keeping ID available for reuse")
+                    self.recently_lost_boats[track_id] = {
+                        'last_bbox': self.boat_data[track_id]['last_saved_bbox'],
+                        'lost_time': current_time,
+                        'boat_data': self.boat_data[track_id].copy()
+                    }
+                    del self.boat_data[track_id]
+        
+        # Clean up old lost boats
+        self.cleanup_lost_boats()
+    
+    def cleanup_lost_boats(self):
+        """Remove boats that have been lost for too long"""
+        import time
+        current_time = time.time()
+        
+        to_remove = []
+        for lost_id, lost_info in self.recently_lost_boats.items():
+            if current_time - lost_info['lost_time'] > self.reuse_timeout:
+                to_remove.append(lost_id)
+        
+        for lost_id in to_remove:
+            print(f"🗑️ Permanently removing boat {lost_id} (lost for {self.reuse_timeout}s)")
+            del self.recently_lost_boats[lost_id]
+    
+    def calculate_iou(self, bbox1, bbox2):
+        """Calculate IoU between two bounding boxes"""
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+        
+        if x2 <= x1 or y2 <= y1:
+            return 0
+        
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0
+    def get_boat_size_category(self, bbox):
+        """Categorize boat by bounding box area"""
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        area = width * height
+        
+        if area <= 32**2:  # <= 1,024 pixels
+            return "small", area, 5.0  # 5 second interval
+        elif area <= 96**2:  # <= 9,216 pixels  
+            return "medium", area, 10.0  # 10 second interval
+        else:  # > 9,216 pixels
+            return "large", area, 10.0  # 10 second interval
+    def should_save_boat(self, track_id, current_frame, current_bbox, current_time):
+        """Determine if we should save this boat detection with smart size-based intervals"""
+        
+        # Get size-based save interval
+        size_category, area, required_interval = self.get_boat_size_category(current_bbox)
+        
+        # Global time constraint - use size-based interval
+        if current_time - self.last_save_time < self.save_interval:
+            time_left = self.save_interval - (current_time - self.last_save_time)
+            return False, f"Global save interval: {time_left:.1f}s remaining", False
+        
+        # Check if this is a new track ID
+        if track_id not in self.boat_data:
+            return True, f"New {size_category} boat ID detected (area: {area}px)", True
+        
+        boat_info = self.boat_data[track_id]
+        
+        # Size-specific time constraint for this individual boat
+        time_since_last_save = current_time - boat_info['last_saved_time']
+        if time_since_last_save < required_interval:
+            time_left = required_interval - time_since_last_save
+            return False, f"{size_category.title()} boat interval: {time_left:.1f}s remaining (need {required_interval}s)", False
+        
+        # Check if boat has different angle compared to last saved
+        is_different_angle, similarity_scores = self.angle_detector.is_different_angle(
+            current_frame, current_bbox,
+            boat_info['last_saved_frame'], boat_info['last_saved_bbox']
+        )
+        
+        if is_different_angle:
+            if 'ssim' in similarity_scores:
+                reason = f"Different angle detected for {size_category} boat (SSIM: {similarity_scores['ssim']:.2f}, Hist: {similarity_scores['histogram']:.2f})"
+            else:
+                reason = f"Different angle detected for {size_category} boat (Hist: {similarity_scores['histogram']:.2f})"
+            return True, reason, False
+        else:
+            if 'ssim' in similarity_scores:
+                reason = f"Same angle for {size_category} boat (SSIM: {similarity_scores['ssim']:.2f}, Hist: {similarity_scores['histogram']:.2f})"
+            else:
+                reason = f"Same angle for {size_category} boat (Hist: {similarity_scores['histogram']:.2f})"
+            return False, reason, False
+    
+    def update_boat_data(self, track_id, frame, bbox, current_time):
+        """Update boat data after saving"""
+        self.boat_data[track_id] = {
+            'last_saved_frame': frame.copy(),
+            'last_saved_bbox': bbox.copy(),
+            'last_saved_time': current_time,
+            'save_count': self.boat_data.get(track_id, {}).get('save_count', 0) + 1
+        }
+        self.last_save_time = current_time
+    
+    def get_boat_stats(self):
+        """Get statistics about tracked boats"""
+        stats = {}
+        for track_id, data in self.boat_data.items():
+            stats[track_id] = data.get('save_count', 0)
+        return stats
+    
+    def get_full_stats(self):
+        """Get comprehensive statistics including lost boats"""
+        return {
+            'active_boats': self.get_boat_stats(),
+            'recently_lost_count': len(self.recently_lost_boats),
+            'lost_boat_ids': list(self.recently_lost_boats.keys())
+        }
+
+    # Also update the process_frame method to handle reused IDs:
+
+    def process_frame(self, current_time, frame_count):
+        """Process single frame for boat detection using SORT tracking with ID reuse"""
+        try:
+            # Ensure video is playing before processing
+            if not self.ensure_video_playing():
+                print("⚠ Video not playing, but continuing...")
+            
+            # Less frequent mouse movement to avoid interfering with video
+            if frame_count % 150 == 0:  # Every 150 frames (30 seconds at 0.2s intervals)
+                self.move_mouse_away_from_video()
+            
+            # Capture frame
+            frame = self.get_video_frame()
+            if frame is None:
+                return False
+            
+            # Detect boats using YOLO
+            detections = self.yolo_detector.detect_boats(frame)
+            
+            if detections:
+                print(f"🚢 Detected {len(detections)} boat(s)")
+                self.stats['boats_detected'] += len(detections)
+                
+                # Update SORT tracker with detections (includes ID reuse logic)
+                tracks = self.sort_tracker.update_tracks(detections)
+                
+                if tracks:
+                    print(f"📊 Tracking {len(tracks)} boat(s)")
+                    
+                    # Check if any boat should trigger a save
+                    save_triggered = False
+                    trigger_boat_id = None
+                    save_reason = ""
+                    
+                    # Process each tracked boat to find if any should trigger a save
+                    for track in tracks:
+                        track_id = track['track_id']
+                        is_new = track['is_new']
+                        is_reused = track.get('is_reused', False)
+                        bbox = track['bbox']
+                        
+                        # Check if we should save this detection
+                        should_save, reason, is_new_id = self.sort_tracker.should_save_boat(
+                            track_id, frame, bbox, current_time
+                        )
+                        
+                        # Enhanced status display
+                        if is_reused:
+                            status = "REUSED ID"
+                        elif is_new:
+                            status = "NEW ID"
+                        else:
+                            status = "EXISTING"
+                        
+                        print(f"  🚢 Boat {track_id} ({status}): {reason}")
+                        
+                        if should_save and not save_triggered:
+                            save_triggered = True
+                            trigger_boat_id = track_id
+                            save_reason = reason
+                            
+                            # Update the boat that triggered the save
+                            self.sort_tracker.update_boat_data(track_id, frame, bbox, current_time)
+                            
+                            # Update statistics
+                            if is_new_id:
+                                self.stats['new_ids_detected'] += 1
+                            else:
+                                self.stats['angle_changes_detected'] += 1
+                    
+                    # If any boat triggered a save, save the frame with ALL detections
+                    if save_triggered:
+                        if self.save_frame_with_all_boats(frame, tracks, trigger_boat_id, save_reason, current_time):
+                            for track in tracks:
+                                self.stats['active_boat_folders'].add(track['track_id'])
+            
+            self.stats['frames_processed'] += 1
+            return True
+            
+        except Exception as e:
+            print(f"✗ Error processing frame: {e}")
+            return False
+    
 class IntelligentYouTubeBoatScraper:
     """Main scraper class with intelligent boat detection"""
     
@@ -350,7 +1014,7 @@ class IntelligentYouTubeBoatScraper:
         
         # Initialize detection components
         self.yolo_detector = YOLOBoatDetector()
-        self.tracking_manager = BoatTrackingManager()
+        self.sort_tracker = SORTBoatTracker()  # Replace old tracking system
         
         # Statistics
         self.stats = {
@@ -358,13 +1022,17 @@ class IntelligentYouTubeBoatScraper:
             'boats_detected': 0,
             'images_saved': 0,
             'active_boat_folders': set(),
-            'target_frames': 0  # Will be set based on duration
+            'target_frames': 0,  # Will be set based on duration
+            'new_ids_detected': 0,
+            'angle_changes_detected': 0
         }
         
         # Ensure base directory exists
         os.makedirs(self.base_dir, exist_ok=True)
         print(f"✓ Base output directory: {self.base_dir}")
         print(f"✓ Files will be organized by: YEAR/MONTH/DAY/HOUR/")
+        print(f"✓ Using SORT tracking with 0.2s inference interval")
+        print(f"✓ Saving conditions: 5s interval + (new ID OR angle change)")
         print(f"✓ YouTube URL: {self.url}")
     
     def setup_driver(self):
@@ -688,16 +1356,16 @@ class IntelligentYouTubeBoatScraper:
         except Exception as e:
             print(f"✗ Error saving boat image: {e}")
             return False
-    
+        
     def process_frame(self, current_time, frame_count):
-        """Process single frame for boat detection"""
+        """Process single frame for boat detection using SORT tracking"""
         try:
             # Ensure video is playing before processing
             if not self.ensure_video_playing():
                 print("⚠ Video not playing, but continuing...")
             
             # Less frequent mouse movement to avoid interfering with video
-            if frame_count % 30 == 0:  # Every 30 frames instead of 15
+            if frame_count % 150 == 0:  # Every 150 frames (30 seconds at 0.2s intervals)
                 self.move_mouse_away_from_video()
             
             # Capture frame
@@ -705,33 +1373,57 @@ class IntelligentYouTubeBoatScraper:
             if frame is None:
                 return False
             
-            # Detect boats
+            # Detect boats using YOLO
             detections = self.yolo_detector.detect_boats(frame)
             
             if detections:
                 print(f"🚢 Detected {len(detections)} boat(s)")
                 self.stats['boats_detected'] += len(detections)
                 
-                # Assign detections to trackers
-                assigned_detections = self.tracking_manager.assign_detections_to_trackers(detections, current_time)
+                # Update SORT tracker with detections
+                tracks = self.sort_tracker.update_tracks(detections)
                 
-                # Process each assigned detection
-                for assignment in assigned_detections:
-                    detection = assignment['detection']
-                    tracker_id = assignment['tracker_id']
-                    is_new = assignment['is_new_tracker']
+                if tracks:
+                    print(f"📊 Tracking {len(tracks)} boat(s)")
                     
-                    tracker = self.tracking_manager.active_trackers[tracker_id]
+                    # Check if any boat should trigger a save
+                    save_triggered = False
+                    trigger_boat_id = None
+                    save_reason = ""
                     
-                    # Check if we should save this image
-                    should_save, reason = tracker.should_save_image(detection['bbox'], current_time)
+                    # Process each tracked boat to find if any should trigger a save
+                    for track in tracks:
+                        track_id = track['track_id']
+                        is_new = track['is_new']
+                        bbox = track['bbox']
+                        
+                        # Check if we should save this detection
+                        should_save, reason, is_new_id = self.sort_tracker.should_save_boat(
+                            track_id, frame, bbox, current_time
+                        )
+                        
+                        status = "NEW ID" if is_new else "EXISTING"
+                        print(f"  🚢 Boat {track_id} ({status}): {reason}")
+                        
+                        if should_save and not save_triggered:
+                            save_triggered = True
+                            trigger_boat_id = track_id
+                            save_reason = reason
+                            
+                            # Update the boat that triggered the save
+                            self.sort_tracker.update_boat_data(track_id, frame, bbox, current_time)
+                            
+                            # Update statistics
+                            if is_new_id:
+                                self.stats['new_ids_detected'] += 1
+                            else:
+                                self.stats['angle_changes_detected'] += 1
                     
-                    status = "NEW" if is_new else "EXISTING"
-                    print(f"  Boat {tracker_id} ({status}): {reason}")
-                    
-                    if should_save:
-                        if self.save_boat_image(frame, detection, tracker_id, current_time):
-                            tracker.update_after_save(detection['bbox'], current_time)
+                    # If any boat triggered a save, save the frame with ALL detections
+                    if save_triggered:
+                        if self.save_frame_with_all_boats(frame, tracks, trigger_boat_id, save_reason, current_time):
+                            for track in tracks:
+                                self.stats['active_boat_folders'].add(track['track_id'])
             
             self.stats['frames_processed'] += 1
             return True
@@ -739,36 +1431,128 @@ class IntelligentYouTubeBoatScraper:
         except Exception as e:
             print(f"✗ Error processing frame: {e}")
             return False
-    
+    def save_frame_with_all_boats(self, frame, all_tracks, trigger_boat_id, save_reason, current_time):
+        """Save frame with JSON containing all detected boats with size categories"""
+        try:
+            # Create datetime-based folder structure
+            datetime_folder = self.create_datetime_folder()
+            
+            # Create simple, readable filename
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
+            base_filename = f"frame_{timestamp}"
+            
+            # Save image
+            image_filepath = os.path.join(datetime_folder, f"{base_filename}.jpg")
+            cv2.imwrite(image_filepath, frame)
+            
+            # Create simplified JSON metadata with all boats including size info
+            all_boats_data = []
+            for track in all_tracks:
+                bbox = track['bbox']
+                size_category, area, interval = self.sort_tracker.get_boat_size_category(bbox)
+
+            
+                boat_data = {
+                    "boat_id": track['track_id'],
+                    "track_id": track['track_id'], 
+                    "confidence": round(track['confidence'], 3),
+                    "class": track['class'],
+                    "size_category": size_category,
+                    "bbox_area": area,
+                    "save_interval": interval,
+                    "bbox": {
+                        "x1": bbox[0],
+                        "y1": bbox[1], 
+                        "x2": bbox[2],
+                        "y2": bbox[3],
+                        "width": bbox[2] - bbox[0],
+                        "height": bbox[3] - bbox[1]
+                    }
+                }
+                all_boats_data.append(boat_data)
+            
+            # Find trigger boat size info
+            trigger_boat_data = next((boat for boat in all_boats_data if boat['boat_id'] == trigger_boat_id), None)
+            trigger_size_category = trigger_boat_data['size_category'] if trigger_boat_data else "unknown"
+            
+            # Main metadata structure
+            metadata = {
+                "timestamp": timestamp,
+                "youtube_url": self.url,
+                "camera_location": self.camera_location,
+                "trigger_boat_id": trigger_boat_id,
+                "trigger_boat_size": trigger_size_category,
+                "save_reason": save_reason,
+                "tracking_method": "SORT",
+                "total_boats_detected": len(all_tracks),
+                "boats": all_boats_data,  # All boats in this frame with size info
+                "frame_info": {
+                    "frame_width": frame.shape[1],
+                    "frame_height": frame.shape[0]
+                },
+                "size_distribution": {
+                    "small": len([b for b in all_boats_data if b['size_category'] == 'small']),
+                    "medium": len([b for b in all_boats_data if b['size_category'] == 'medium']), 
+                    "large": len([b for b in all_boats_data if b['size_category'] == 'large'])
+                }
+            }
+            
+            # Save JSON metadata  
+            json_filepath = os.path.join(datetime_folder, f"{base_filename}.json")
+            with open(json_filepath, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            self.stats['images_saved'] += 1
+            
+            print(f"💾 Saved frame triggered by {trigger_size_category} boat {trigger_boat_id}: {base_filename}.jpg + .json")
+            print(f"   📁 Path: {datetime_folder}")
+            print(f"   🚢 Contains {len(all_tracks)} boat(s): {[f"{t['track_id']}({self.sort_tracker.get_boat_size_category(t['bbox'])[0]})" for t in all_tracks]}")
+
+            
+            return True
+            
+        except Exception as e:
+            print(f"✗ Error saving frame: {e}")
+            return False
+
+    # Update the statistics display to show size information:
+
     def print_statistics_for_saved_images_mode(self, successful_frames, target_saved_images):
-        """Print statistics for saved images mode"""
+        """Print statistics for saved images mode with size information"""
         print(f"\n📊 STATISTICS:")
-        print(f"  Frames processed: {successful_frames}")
+        print(f"  Frames processed: {successful_frames} (0.2s intervals)")
         print(f"  Saved images: {self.stats['images_saved']}/{target_saved_images}")
         if target_saved_images > 0:
             progress = (self.stats['images_saved'] / target_saved_images) * 100
             print(f"  Progress: {progress:.1f}%")
         print(f"  Total boat detections: {self.stats['boats_detected']}")
+        print(f"  New IDs detected: {self.stats['new_ids_detected']}")
+        print(f"  Angle changes detected: {self.stats['angle_changes_detected']}")
         print(f"  Active boat IDs: {len(self.stats['active_boat_folders'])}")
-        print(f"  Current trackers: {len(self.tracking_manager.active_trackers)}")
         print(f"  Camera location: {self.camera_location}")
+        print(f"  Save intervals: Small boats=5s, Medium/Large boats=10s")
         
-        if self.stats['active_boat_folders']:
-            print(f"  Boat folders: {sorted(list(self.stats['active_boat_folders']))}")
+        # Show current SORT tracker stats with size info
+        boat_stats = self.sort_tracker.get_boat_stats()
+        if boat_stats:
+            print(f"  Currently tracked boats: {sorted(list(boat_stats.keys()))}")
+            print(f"  Saves per boat: {dict(sorted(boat_stats.items()))}")
             
-            # Show saves per boat
-            boat_saves = {}
-            for boat_id in self.stats['active_boat_folders']:
-                if boat_id in self.tracking_manager.active_trackers:
-                    boat_saves[boat_id] = self.tracking_manager.active_trackers[boat_id].save_count
-            if boat_saves:
-                print(f"  Saves per boat: {dict(sorted(boat_saves.items()))}")
-
+            # Show size distribution of currently tracked boats
+            size_counts = {"small": 0, "medium": 0, "large": 0}
+            for track_id in boat_stats.keys():
+                if track_id in self.sort_tracker.boat_data:
+                    last_bbox = self.sort_tracker.boat_data[track_id]['last_saved_bbox']
+                    size_cat, _, _ = self.sort_tracker.get_boat_size_category(last_bbox)
+                    size_counts[size_cat] += 1
+            
+            if any(size_counts.values()):
+                print(f"  Boat sizes: Small={size_counts['small']}, Medium={size_counts['medium']}, Large={size_counts['large']}")
     def print_statistics(self, successful_frames=None):
         """Print current statistics"""
         print(f"\n📊 STATISTICS:")
         if successful_frames is not None:
-            print(f"  Successful frames: {successful_frames}/{self.stats['target_frames']}")
+            print(f"  Successful frames: {successful_frames}/{self.stats['target_frames']} (0.2s intervals)")
             if self.stats['target_frames'] > 0:
                 progress = (successful_frames / self.stats['target_frames']) * 100
                 print(f"  Progress: {progress:.1f}%")
@@ -779,22 +1563,18 @@ class IntelligentYouTubeBoatScraper:
                 print(f"  Progress: {progress:.1f}%")
         print(f"  Total boat detections: {self.stats['boats_detected']}")
         print(f"  Images saved: {self.stats['images_saved']}")
+        print(f"  New IDs detected: {self.stats['new_ids_detected']}")
+        print(f"  Angle changes detected: {self.stats['angle_changes_detected']}")
         print(f"  Active boat IDs: {len(self.stats['active_boat_folders'])}")
-        print(f"  Current trackers: {len(self.tracking_manager.active_trackers)}")
         print(f"  Camera location: {self.camera_location}")
         
-        if self.stats['active_boat_folders']:
-            print(f"  Boat folders: {sorted(list(self.stats['active_boat_folders']))}")
-            
-            # Show saves per boat
-            boat_saves = {}
-            for boat_id in self.stats['active_boat_folders']:
-                if boat_id in self.tracking_manager.active_trackers:
-                    boat_saves[boat_id] = self.tracking_manager.active_trackers[boat_id].save_count
-            if boat_saves:
-                print(f"  Saves per boat: {dict(sorted(boat_saves.items()))}")
+        # Show SORT tracker stats
+        boat_stats = self.sort_tracker.get_boat_stats()
+        if boat_stats:
+            print(f"  Tracked boats: {sorted(list(boat_stats.keys()))}")
+            print(f"  Saves per boat: {dict(sorted(boat_stats.items()))}")
     
-    def run_intelligent_scraping(self, duration_minutes=None, max_frames=None, check_interval=2):
+    def run_intelligent_scraping(self, duration_minutes=None, max_frames=None, check_interval=0.2):
         """Main intelligent scraping loop - can limit by time OR saved boat images"""
         
         if duration_minutes is not None and max_frames is not None:
@@ -802,18 +1582,20 @@ class IntelligentYouTubeBoatScraper:
         if duration_minutes is None and max_frames is None:
             raise ValueError("Must specify either duration_minutes or max_frames")
         
-        print(f"\n=== STARTING INTELLIGENT BOAT DETECTION ===")
-        print(f"Check interval: {check_interval} seconds")
+        print(f"\n=== STARTING INTELLIGENT BOAT DETECTION WITH SORT ===")
+        print(f"Inference interval: {check_interval} seconds (5x faster than before)")
         print(f"Camera location: {self.camera_location}")
         
         # Determine run mode and target
         if max_frames is not None:
             # Frame-based mode (now means max saved boat images)
             target_saved_images = max_frames
-            estimated_time = "Variable (depends on boat detection and diversity)"
+            estimated_frames = target_saved_images * 25  # Rough estimate: 25 frames per save
+            estimated_time = (estimated_frames * check_interval) / 60
             print(f"Mode: Saved images limit")
             print(f"Target saved boat images: {target_saved_images}")
-            print(f"Estimated time: {estimated_time}")
+            print(f"Estimated frames to process: ~{estimated_frames}")
+            print(f"Estimated time: ~{estimated_time:.1f} minutes")
             run_by_saved_images = True
             end_time = None
         else:
@@ -825,8 +1607,9 @@ class IntelligentYouTubeBoatScraper:
             run_by_saved_images = False
             end_time = time.time() + (duration_minutes * 60)
         
-        print(f"Max saves per boat: 100 frames")
-        print(f"Min time between saves per boat: 5 seconds (for diversity)")
+        print(f"SORT tracking: Advanced multi-object tracking with Kalman filters")
+        print(f"Saving conditions: 5s minimum interval + (new ID OR different angle)")
+        print(f"Angle detection: SSIM + Histogram correlation analysis")
         print(f"Files organized by: {self.base_dir}/YEAR/MONTH/DAY/HOUR/")
         
         start_time = time.time()
@@ -854,9 +1637,9 @@ class IntelligentYouTubeBoatScraper:
                 if success:
                     successful_frames += 1
                     if run_by_saved_images:
-                        print(f"📊 Frame {successful_frames} processed | Saved images: {self.stats['images_saved']}/{target_saved_images}")
+                        print(f"📊 Frame {successful_frames} processed | Saved: {self.stats['images_saved']}/{target_saved_images} | New IDs: {self.stats['new_ids_detected']} | Angles: {self.stats['angle_changes_detected']}")
                     else:
-                        print(f"📊 Successfully processed frame {successful_frames}")
+                        print(f"📊 Successfully processed frame {successful_frames} | Saved: {self.stats['images_saved']}")
                 else:
                     print(f"⚠ Frame processing failed (attempt {attempt_count + 1}), continuing...")
                 
@@ -870,22 +1653,22 @@ class IntelligentYouTubeBoatScraper:
                         self.print_statistics(successful_frames)
                     last_stats_time = current_time
                 
-                # Wait before next attempt
+                # Wait before next attempt (0.2 seconds)
                 time.sleep(check_interval)
                 
-                # Very gentle video keep-alive (less frequent)
-                if attempt_count % 50 == 0:  # Every 50 attempts
+                # Very gentle video keep-alive (less frequent due to faster processing)
+                if attempt_count % 250 == 0:  # Every 250 attempts (50 seconds)
                     self.keep_video_active()
                 
                 # Safety check - if too many consecutive failures, break
-                if attempt_count > 200 and successful_frames == 0:
+                if attempt_count > 1000 and successful_frames == 0:
                     print("❌ Too many failed attempts, stopping...")
                     break
                     
                 # Safety check for saved images mode - if processing too many frames without saves
-                if run_by_saved_images and successful_frames > target_saved_images * 10 and self.stats['images_saved'] == 0:
-                    print(f"⚠ Processed {successful_frames} frames but saved 0 images. Check if boats are being detected.")
-                    print("This could be normal if no boats are visible or diversity constraints are too strict.")
+                if run_by_saved_images and successful_frames > target_saved_images * 50 and self.stats['images_saved'] == 0:
+                    print(f"⚠ Processed {successful_frames} frames but saved 0 images.")
+                    print("This could be normal if no boats are visible or saving conditions are strict.")
                     
                     user_input = input("Continue? (y/n): ").strip().lower()
                     if user_input != 'y':
@@ -906,6 +1689,7 @@ class IntelligentYouTubeBoatScraper:
         if attempt_count > 0:
             success_rate = (successful_frames / attempt_count) * 100
             print(f"Success rate: {success_rate:.1f}%")
+        print(f"Average processing rate: {successful_frames / ((time.time() - start_time) / 60):.1f} frames/minute")
         print(f"Output directory: {self.base_dir} (organized by date/time)")
         
         # Summary of saved files
@@ -934,18 +1718,12 @@ class IntelligentYouTubeBoatScraper:
                                                 print(f"  {year}/{month}/{day}/{hour}h: {jpg_files} images, {json_files} JSON files")
                                                 total_files += jpg_files
         
-        # Also show boat ID distribution
-        if self.stats['active_boat_folders']:
-            boat_counts = {}
-            # Count saves per boat from trackers
-            for boat_id in self.stats['active_boat_folders']:
-                if boat_id in self.tracking_manager.active_trackers:
-                    boat_counts[boat_id] = self.tracking_manager.active_trackers[boat_id].save_count
-            
-            if boat_counts:
-                print(f"\n🚢 BOAT ID DISTRIBUTION:")
-                for boat_id, count in sorted(boat_counts.items()):
-                    print(f"  Boat {boat_id:03d}: {count} images")
+        # Also show boat ID distribution from SORT tracker
+        boat_stats = self.sort_tracker.get_boat_stats()
+        if boat_stats:
+            print(f"\n🚢 SORT TRACKING SUMMARY:")
+            for boat_id, count in sorted(boat_stats.items()):
+                print(f"  Boat {boat_id:03d}: {count} images saved")
         
         print(f"\nTotal files saved: {total_files * 2} ({total_files} images + {total_files} JSON files)")
     
@@ -956,8 +1734,12 @@ class IntelligentYouTubeBoatScraper:
             print("✓ Browser closed")
 
 def main():
-    print("🚢 INTELLIGENT YOUTUBE BOAT DETECTION SCRAPER")
-    print("=" * 50)
+    print("🚢 INTELLIGENT YOUTUBE BOAT DETECTION SCRAPER - SORT EDITION")
+    print("=" * 60)
+    print("📦 Required packages: ultralytics selenium webdriver-manager opencv-python")
+    print("                     numpy scikit-image scipy filterpy")
+    print("⚡ Features: SORT tracking, 0.2s inference, angle detection, 5s save intervals")
+    print("=" * 60)
     
     # Get YouTube URL
     youtube_url = input("Enter YouTube URL: ").strip()
@@ -1015,13 +1797,13 @@ def main():
         
         if choice in time_duration_map:
             duration = time_duration_map[choice]
-            print(f"\n🚀 Starting {duration}-minute intelligent boat detection session...")
+            print(f"\n🚀 Starting {duration}-minute SORT tracking session...")
             scraper.run_intelligent_scraping(duration_minutes=duration)
             
         elif choice == '4':
             try:
                 duration = int(input("Enter duration in minutes: "))
-                print(f"\n🚀 Starting {duration}-minute intelligent boat detection session...")
+                print(f"\n🚀 Starting {duration}-minute SORT tracking session...")
                 scraper.run_intelligent_scraping(duration_minutes=duration)
             except ValueError:
                 print("Invalid input, using 15 minutes")
@@ -1029,13 +1811,13 @@ def main():
                 
         elif choice in saved_images_map:
             images = saved_images_map[choice]
-            print(f"\n🚀 Starting session to collect {images} saved boat images...")
+            print(f"\n🚀 Starting SORT session to collect {images} saved boat images...")
             scraper.run_intelligent_scraping(max_frames=images)
             
         elif choice == '8':
             try:
                 images = int(input("Enter number of boat images to save: "))
-                print(f"\n🚀 Starting session to collect {images} saved boat images...")
+                print(f"\n🚀 Starting SORT session to collect {images} saved boat images...")
                 scraper.run_intelligent_scraping(max_frames=images)
             except ValueError:
                 print("Invalid input, using 50 boat images")
