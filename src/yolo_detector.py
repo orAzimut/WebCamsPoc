@@ -60,7 +60,7 @@ class YOLOBoatDetector:
                 persist=True, 
                 verbose=False, 
                 device=self.device,
-                imgsz=320,          # Smaller size for speed
+                imgsz=640,          # Smaller size for speed
                 conf=0.15,           # Higher confidence threshold
                 iou=0.5,
                 max_det=8,          # Fewer detections for speed

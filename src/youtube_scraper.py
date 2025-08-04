@@ -16,7 +16,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 import math
 from collections import defaultdict
 
-from boat_tracker import SimpleBoatTracker
+from boat_tracker import BoatTracker
 from yolo_detector import YOLOBoatDetector
 
 class IntelligentYouTubeBoatScraper:
@@ -36,7 +36,7 @@ class IntelligentYouTubeBoatScraper:
         
         # Initialize detection components
         self.yolo_detector = YOLOBoatDetector()
-        self.simple_tracker = SimpleBoatTracker()
+        self.simple_tracker = BoatTracker()
         
         # Statistics
         self.stats = {
@@ -84,18 +84,7 @@ class IntelligentYouTubeBoatScraper:
             # IMPROVED CACHING LOGIC
             service = None
             
-            # Method 1: Try manual chromedriver in project folder
-            local_paths = [
-                os.path.join(os.path.dirname(__file__), "chromedriver.exe"),
-                os.path.join(os.getcwd(), "chromedriver.exe"),
-                "./chromedriver.exe"
-            ]
-            
-            for path in local_paths:
-                if os.path.exists(path):
-                    service = Service(path)
-                    print(f"✓ Using local ChromeDriver: {path}")
-                    break
+       
             
             # Method 2: Find cached ChromeDriver (FIXED PATHS)
             if service is None:
@@ -414,77 +403,95 @@ class IntelligentYouTubeBoatScraper:
             return False
     
     def process_frame(self, current_time, frame_count):
-        """Process single frame for boat detection using YOLO tracking"""
-        try:
-            # Ensure video is playing before processing
-            if not self.ensure_video_playing():
-                print("⚠ Video not playing, but continuing...")
-            
-            # Less frequent mouse movement to avoid interfering with video
-            if frame_count % 30 == 0:  # Every 30 frames instead of 15
-                self.move_mouse_away_from_video()
-            
-            # Capture frame
-            frame = self.get_video_frame()
-            if frame is None:
-                return False
-            
-            # Track boats using YOLO's built-in tracking
-            tracked_boats = self.yolo_detector.track_boats(frame)
-            
-            if tracked_boats:
-                print(f"🚢 Tracked {len(tracked_boats)} boat(s)")
-                self.stats['boats_detected'] += len(tracked_boats)
+            """Process single frame for boat detection using YOLO tracking"""
+            try:
+                # Ensure video is playing before processing
+                if not self.ensure_video_playing():
+                    print("⚠ Video not playing, but continuing...")
                 
-                # Process each tracked boat
-                for boat in tracked_boats:
-                    track_id = boat['track_id']
+                # Less frequent mouse movement to avoid interfering with video
+                if frame_count % 30 == 0:  # Every 30 frames instead of 15
+                    self.move_mouse_away_from_video()
+                
+                # Capture frame
+                frame = self.get_video_frame()
+                if frame is None:
+                    return False
+                
+                # Track boats using YOLO's built-in tracking
+                tracked_boats = self.yolo_detector.track_boats(frame)
+                
+                if tracked_boats:
+                    print(f"🚢 Tracked {len(tracked_boats)} boat(s)")
+                    self.stats['boats_detected'] += len(tracked_boats)
                     
-                    # Skip boats without valid tracking ID
-                    if track_id is None:
-                        print(f"  ⚠ Boat detected but no tracking ID assigned")
-                        continue
-                    
-                    # Check if we should save this boat
-                    should_save, reason = self.simple_tracker.should_save_boat(track_id, current_time)
-                    
-                    print(f"  🚢 Boat ID {track_id}: {reason}")
-                    
-                    if should_save:
-                        if self.save_boat_image(frame, boat, current_time):
-                            print(f"    ✅ Saved successfully")
-                        else:
-                            print(f"    ❌ Save failed")
-            
-            self.stats['frames_processed'] += 1
-            return True
-            
-        except Exception as e:
-            print(f"✗ Error processing frame: {e}")
-            return False
+                    # Process each tracked boat
+                    for boat in tracked_boats:
+                        track_id = boat['track_id']
+                        
+                        # Skip boats without valid tracking ID
+                        if track_id is None:
+                            print(f"  ⚠ Boat detected but no tracking ID assigned")
+                            continue
+                        
+                        # ENHANCED DETECTION: Extract bbox and crop boat image
+                        try:
+                            bbox = boat['bbox']  # Should be [x1, y1, x2, y2] or [x, y, w, h]
+                            
+                            # Handle different bbox formats
+                            if len(bbox) == 4:
+                                # Check if it's [x1, y1, x2, y2] or [x, y, w, h]
+                                if bbox[2] > frame.shape[1] or bbox[3] > frame.shape[0]:
+                                    # Likely [x, y, w, h] format
+                                    x, y, w, h = bbox
+                                    x1, y1, x2, y2 = x, y, x + w, y + h
+                                    bbox_for_tracker = (x, y, w, h)  # BoatTracker expects (x, y, w, h)
+                                else:
+                                    # Likely [x1, y1, x2, y2] format
+                                    x1, y1, x2, y2 = bbox
+                                    w, h = x2 - x1, y2 - y1
+                                    bbox_for_tracker = (x1, y1, w, h)  # Convert to (x, y, w, h)
+                            else:
+                                raise ValueError(f"Unexpected bbox format: {bbox}")
+                            
+                            # Ensure bbox is within frame bounds
+                            x1 = max(0, int(x1))
+                            y1 = max(0, int(y1))
+                            x2 = min(frame.shape[1], int(x2))
+                            y2 = min(frame.shape[0], int(y2))
+                            
+                            # Crop boat image from frame
+                            boat_image = frame[y1:y2, x1:x2]
+                            
+                            # Check if we should save this boat (ENHANCED VERSION)
+                            should_save, reason = self.simple_tracker.should_save_boat(
+                                track_id, 
+                                current_time, 
+                                bbox_for_tracker,  # (x, y, width, height)
+                                boat_image         # cropped boat image
+                            )
+                            
+                        except Exception as e:
+                            print(f"  ⚠ Enhanced detection failed for boat {track_id}: {e}")
+                            # Fallback to basic detection
+                            should_save, reason = self.simple_tracker.should_save_boat(track_id, current_time)
+                        
+                        print(f"  🚢 Boat ID {track_id}: {reason}")
+                        
+                        if should_save:
+                            if self.save_boat_image(frame, boat, current_time):
+                                print(f"    ✅ Saved successfully")
+                            else:
+                                print(f"    ❌ Save failed")
+                
+                self.stats['frames_processed'] += 1
+                return True
+                
+            except Exception as e:
+                print(f"✗ Error processing frame: {e}")
+                return False
     
-    def print_statistics_for_saved_images_mode(self, successful_frames, target_saved_images):
-        """Print statistics for saved images mode"""
-        print(f"\n📊 STATISTICS:")
-        print(f"  Frames processed: {successful_frames}")
-        print(f"  Saved images: {self.stats['images_saved']}/{target_saved_images}")
-        if target_saved_images > 0:
-            progress = (self.stats['images_saved'] / target_saved_images) * 100
-            print(f"  Progress: {progress:.1f}%")
-        print(f"  Total boat detections: {self.stats['boats_detected']}")
-        print(f"  Active boat IDs: {len(self.stats['active_boat_ids'])}")
-        print(f"  Currently tracked IDs: {len(self.simple_tracker.get_tracked_boat_ids())}")
-        
-        if self.stats['active_boat_ids']:
-            print(f"  Boat IDs seen: {sorted(list(self.stats['active_boat_ids']))}")
-            
-            # Show saves per boat
-            boat_saves = {}
-            for boat_id in self.stats['active_boat_ids']:
-                boat_saves[boat_id] = self.simple_tracker.get_save_count(boat_id)
-            if boat_saves:
-                print(f"  Saves per boat: {dict(sorted(boat_saves.items()))}")
-
+   
     def print_statistics(self, successful_frames=None):
         """Print current statistics"""
         print(f"\n📊 STATISTICS:")
@@ -513,154 +520,44 @@ class IntelligentYouTubeBoatScraper:
             if boat_saves:
                 print(f"  Saves per boat: {dict(sorted(boat_saves.items()))}")
     
-    def run_intelligent_scraping(self, duration_minutes=None, max_frames=None, check_interval=0.1):
-        """Main intelligent scraping loop - can limit by time OR saved boat images"""
+    def run_continuous_scraping(self, check_interval=0.05):
+        """Run continuous boat detection until stopped with Ctrl+C"""
         
-        if duration_minutes is not None and max_frames is not None:
-            raise ValueError("Cannot specify both duration_minutes and max_frames")
-        if duration_minutes is None and max_frames is None:
-            raise ValueError("Must specify either duration_minutes or max_frames")
-        
-        print(f"\n=== STARTING INTELLIGENT BOAT DETECTION WITH YOLO TRACKING ===")
-        print(f"Check interval: {check_interval} seconds")
-        print(f"Save interval: {self.simple_tracker.min_save_interval} seconds per boat")
-        
-        # Determine run mode and target
-        if max_frames is not None:
-            # Frame-based mode (now means max saved boat images)
-            target_saved_images = max_frames
-            estimated_time = "Variable (depends on boat detection)"
-            print(f"Mode: Saved images limit")
-            print(f"Target saved boat images: {target_saved_images}")
-            print(f"Estimated time: {estimated_time}")
-            run_by_saved_images = True
-            end_time = None
-        else:
-            # Time-based mode  
-            self.stats['target_frames'] = int((duration_minutes * 60) / check_interval)
-            print(f"Mode: Time-based limit")
-            print(f"Duration: {duration_minutes} minutes")
-            print(f"Target frames: ~{self.stats['target_frames']} frames")
-            run_by_saved_images = False
-            end_time = time.time() + (duration_minutes * 60)
-        
-        print(f"Max saves per boat: {self.simple_tracker.max_saves_per_boat} images")
+        print(f"\n=== CONTINUOUS BOAT DETECTION ===")
+        print(f"Press Ctrl+C to stop at any time...")
         print(f"Files organized by: {self.base_dir}/YEAR/MONTH/DAY/HOUR/")
         
         start_time = time.time()
-        attempt_count = 0  # Total attempts (for timing)
-        successful_frames = 0  # Only count successful frame processing
+        attempt_count = 0
+        successful_frames = 0
         last_stats_time = start_time
         
         try:
-            while True:
+            while True:  # Simple infinite loop
                 current_time = time.time()
                 
-                # Check stopping conditions
-                if run_by_saved_images:
-                    if self.stats['images_saved'] >= target_saved_images:
-                        print(f"\n✅ Reached target saved images: {target_saved_images}")
-                        break
-                else:
-                    if current_time >= end_time:
-                        print(f"\n✅ Reached time limit: {duration_minutes} minutes")
-                        break
-                
-                # Process frame
                 success = self.process_frame(current_time, attempt_count)
                 
                 if success:
                     successful_frames += 1
-                    if run_by_saved_images:
-                        print(f"📊 Frame {successful_frames} processed | Saved images: {self.stats['images_saved']}/{target_saved_images}")
-                    else:
-                        print(f"📊 Successfully processed frame {successful_frames}")
-                else:
-                    print(f"⚠ Frame processing failed (attempt {attempt_count + 1}), continuing...")
+                    print(f"📊 Frame {successful_frames} | Saved: {self.stats['images_saved']} | Boats: {len(self.stats['active_boat_ids'])}")
                 
                 attempt_count += 1
                 
-                # Print statistics every 30 seconds
+                # Stats every 30 seconds
                 if current_time - last_stats_time >= 30:
-                    if run_by_saved_images:
-                        self.print_statistics_for_saved_images_mode(successful_frames, target_saved_images)
-                    else:
-                        self.print_statistics(successful_frames)
+                    self.print_statistics(successful_frames)
                     last_stats_time = current_time
                 
-                # Wait before next attempt
                 time.sleep(check_interval)
                 
-                # Very gentle video keep-alive (less frequent)
-                if attempt_count % 50 == 0:  # Every 50 attempts
+                if attempt_count % 50 == 0:
                     self.keep_video_active()
-                
-                # Safety check - if too many consecutive failures, break
-                if attempt_count > 200 and successful_frames == 0:
-                    print("❌ Too many failed attempts, stopping...")
-                    break
-                    
-                # Safety check for saved images mode - if processing too many frames without saves
-                if run_by_saved_images and successful_frames > target_saved_images * 10 and self.stats['images_saved'] == 0:
-                    print(f"⚠ Processed {successful_frames} frames but saved 0 images. Check if boats are being detected.")
-                    print("This could be normal if no boats are visible.")
-                    
-                    user_input = input("Continue? (y/n): ").strip().lower()
-                    if user_input != 'y':
-                        break
         
         except KeyboardInterrupt:
-            print("\n🛑 Stopped by user")
-        
-        # Final statistics
-        print(f"\n=== SCRAPING COMPLETE ===")
-        if run_by_saved_images:
-            self.print_statistics_for_saved_images_mode(successful_frames, target_saved_images)
-        else:
+            print(f"\n🛑 Stopped after {(time.time() - start_time)/60:.1f} minutes")
             self.print_statistics(successful_frames)
-        print(f"Total runtime: {(time.time() - start_time)/60:.1f} minutes")
-        print(f"Successful frames: {successful_frames}")
-        print(f"Total attempts: {attempt_count}")
-        if attempt_count > 0:
-            success_rate = (successful_frames / attempt_count) * 100
-            print(f"Success rate: {success_rate:.1f}%")
-        print(f"Output directory: {self.base_dir} (organized by date/time)")
-        
-        # Summary of saved files
-        print(f"\n📁 FILES ORGANIZED BY DATE/TIME:")
-        total_files = 0
-        
-        # Scan the base directory for datetime folders
-        if os.path.exists(self.base_dir):
-            for year in os.listdir(self.base_dir):
-                year_path = os.path.join(self.base_dir, year)
-                if os.path.isdir(year_path) and year.isdigit():
-                    for month in os.listdir(year_path):
-                        month_path = os.path.join(year_path, month)
-                        if os.path.isdir(month_path) and month.isdigit():
-                            for day in os.listdir(month_path):
-                                day_path = os.path.join(month_path, day)
-                                if os.path.isdir(day_path) and day.isdigit():
-                                    for hour in os.listdir(day_path):
-                                        hour_path = os.path.join(day_path, hour)
-                                        if os.path.isdir(hour_path) and hour.isdigit():
-                                            # Count files in this hour folder
-                                            jpg_files = len([f for f in os.listdir(hour_path) if f.endswith('.jpg')])
-                                            json_files = len([f for f in os.listdir(hour_path) if f.endswith('.json')])
-                                            
-                                            if jpg_files > 0 or json_files > 0:
-                                                print(f"  {year}/{month}/{day}/{hour}h: {jpg_files} images, {json_files} JSON files")
-                                                total_files += jpg_files
-        
-        # Show boat ID distribution
-        if self.stats['active_boat_ids']:
-            print(f"\n🚢 BOAT ID DISTRIBUTION:")
-            for boat_id in sorted(self.stats['active_boat_ids']):
-                count = self.simple_tracker.get_save_count(boat_id)
-                print(f"  Boat {boat_id:03d}: {count} images")
-        
-        print(f"\nTotal files saved: {total_files * 2} ({total_files} images + {total_files} JSON files)")
-    
+            
     def cleanup(self):
         """Cleanup resources"""
         if self.driver:
