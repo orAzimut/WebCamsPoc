@@ -402,10 +402,15 @@ class IntelligentYouTubeBoatScraper:
         
         return datetime_folder
     
-    def save_boat_image(self, frame, boat_detection, current_time):
-        """Save boat image with JSON metadata in date/time organized folders"""
+    def save_boat_image(self, boat_image, boat_detection, current_time):
+        """Save individual cropped boat image with clean JSON metadata"""
         try:
             boat_id = boat_detection['track_id']
+            
+            # Validate boat_image
+            if boat_image is None or boat_image.size == 0:
+                print(f"  ⚠ Invalid boat image for boat {boat_id}")
+                return False
             
             # Create datetime-based folder structure
             datetime_folder = self.create_datetime_folder()
@@ -414,25 +419,22 @@ class IntelligentYouTubeBoatScraper:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # Include milliseconds
             base_filename = f"boat_{boat_id:03d}_{timestamp}_{self.stats['images_saved']:04d}"
             
-            # Save image
+            # Save the CROPPED boat image
             image_filepath = os.path.join(datetime_folder, f"{base_filename}.jpg")
-            cv2.imwrite(image_filepath, frame)
+            cv2.imwrite(image_filepath, boat_image)
             
-            # Create JSON metadata
-            bbox = boat_detection['bbox']
+            # Create clean JSON metadata
             metadata = {
                 "timestamp": timestamp,
                 "youtube_url": self.url,
                 "boat_id": boat_id,
                 "confidence": round(boat_detection['confidence'], 3),
                 "class": boat_detection['class'],
-                "bbox": {
-                    "x1": bbox[0],
-                    "y1": bbox[1], 
-                    "x2": bbox[2],
-                    "y2": bbox[3],
-                    "width": bbox[2] - bbox[0],
-                    "height": bbox[3] - bbox[1]
+                "cropped_image_info": {
+                    "width": boat_image.shape[1],
+                    "height": boat_image.shape[0],
+                    "channels": boat_image.shape[2] if len(boat_image.shape) == 3 else 1,
+                    "note": "This JSON corresponds to a cropped boat image"
                 },
                 "camera_location": self.camera_info if self.camera_info else {
                     "name": "Unknown Camera",
@@ -441,16 +443,6 @@ class IntelligentYouTubeBoatScraper:
                     "coordinates": {"lat": None, "lon": None},
                     "timezone": "UTC",
                     "url": self.url
-                },
-                "frame_info": {
-                    "frame_width": frame.shape[1],
-                    "frame_height": frame.shape[0],
-                    "total_frames_processed": self.stats['frames_processed'],
-                    "images_saved_this_run": self.stats['images_saved'] + 1
-                },
-                "run_info": {
-                    "run_timestamp": self.run_timestamp,
-                    "output_directory": self.output_dir
                 },
                 "datetime_path": {
                     "year": datetime.now().strftime("%Y"),
@@ -475,7 +467,8 @@ class IntelligentYouTubeBoatScraper:
             self.stats['active_boat_ids'].add(boat_id)
             self.stats['images_saved'] += 1
             
-            print(f"💾 Saved boat {boat_id} image: {base_filename}.jpg + .json")
+            print(f"💾 Saved boat {boat_id} crop: {base_filename}.jpg + .json")
+            print(f"   📐 Size: {boat_image.shape[1]}x{boat_image.shape[0]} pixels")
             print(f"   📁 Path: {datetime_folder}")
             print(f"   📊 Save #{self.simple_tracker.get_save_count(boat_id)} for boat {boat_id}")
             
@@ -543,8 +536,43 @@ class IntelligentYouTubeBoatScraper:
                             x2 = min(frame.shape[1], int(x2))
                             y2 = min(frame.shape[0], int(y2))
                             
-                            # Crop boat image from frame
-                            boat_image = frame[y1:y2, x1:x2]
+                            # Create wider square crop around the boat
+                            bbox_width = x2 - x1
+                            bbox_height = y2 - y1
+                            
+                            # Calculate center of bbox
+                            center_x = x1 + bbox_width // 2
+                            center_y = y1 + bbox_height // 2
+                            
+                            # Determine square size (larger dimension + padding)
+                            padding_factor = 1.5  # 50% larger than bbox
+                            square_size = int(max(bbox_width, bbox_height) * padding_factor)
+                            
+                            # Ensure square size is even for clean cropping
+                            if square_size % 2 != 0:
+                                square_size += 1
+                            
+                            half_size = square_size // 2
+                            
+                            # Calculate square crop coordinates
+                            crop_x1 = center_x - half_size
+                            crop_y1 = center_y - half_size
+                            crop_x2 = center_x + half_size
+                            crop_y2 = center_y + half_size
+                            
+                            # Ensure crop stays within frame bounds
+                            crop_x1 = max(0, crop_x1)
+                            crop_y1 = max(0, crop_y1)
+                            crop_x2 = min(frame.shape[1], crop_x2)
+                            crop_y2 = min(frame.shape[0], crop_y2)
+                            
+                            # Crop wider square area around boat
+                            boat_image = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+                            
+                            # Validate cropped image
+                            if boat_image is None or boat_image.size == 0:
+                                print(f"  ⚠ Invalid crop for boat {track_id}")
+                                continue
                             
                             # Check if we should save this boat (ENHANCED VERSION)
                             should_save, reason = self.simple_tracker.should_save_boat(
@@ -558,14 +586,19 @@ class IntelligentYouTubeBoatScraper:
                             print(f"  ⚠ Enhanced detection failed for boat {track_id}: {e}")
                             # Fallback to basic detection
                             should_save, reason = self.simple_tracker.should_save_boat(track_id, current_time)
+                            boat_image = None
                         
                         print(f"  🚢 Boat ID {track_id}: {reason}")
                         
                         if should_save:
-                            if self.save_boat_image(frame, boat, current_time):
-                                print(f"    ✅ Saved successfully")
+                            if boat_image is not None:
+                                # Save the CROPPED boat image (FIXED!)
+                                if self.save_boat_image(boat_image, boat, current_time):
+                                    print(f"    ✅ Saved cropped boat image successfully")
+                                else:
+                                    print(f"    ❌ Save failed")
                             else:
-                                print(f"    ❌ Save failed")
+                                print(f"    ❌ No valid boat image to save")
                 
                 self.stats['frames_processed'] += 1
                 return True
@@ -609,6 +642,7 @@ class IntelligentYouTubeBoatScraper:
         print(f"\n=== CONTINUOUS BOAT DETECTION ===")
         print(f"Press Ctrl+C to stop at any time...")
         print(f"Files organized by: {self.base_dir}/YEAR/MONTH/DAY/HOUR/")
+        print(f"💡 Now saving individual cropped boat images (not full frames)")
         
         start_time = time.time()
         attempt_count = 0
