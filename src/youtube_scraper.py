@@ -38,6 +38,57 @@ class IntelligentYouTubeBoatScraper:
         self.yolo_detector = YOLOBoatDetector()
         self.simple_tracker = BoatTracker()
         
+        # Camera location mapping
+        self.camera_locations = {
+            "_KVWehizoNU": {
+                "name": "Rotterdam Port 2",
+                "country": "Netherlands",
+                "city": "Rotterdam",
+                "coordinates": {"lat": 51.9244, "lon": 4.4777},
+                "timezone": "Europe/Amsterdam"
+            },
+            "port-of-newcastle-cam": {
+                "name": "Newcastle Port",
+                "country": "Australia", 
+                "city": "Newcastle",
+                "state": "New South Wales",
+                "coordinates": {"lat": -32.9273, "lon": 151.7817},
+                "timezone": "Australia/Sydney"
+            },
+            "oxx7MqjhOpw": {
+                "name": "Dublin Port Bay",
+                "country": "Ireland",
+                "city": "Dublin",
+                "coordinates": {"lat": 53.3498, "lon": -6.2603},
+                "timezone": "Europe/Dublin"
+            },
+            "nmic4tt88-Y": {
+                "name": "Hamburg Port 1",
+                "country": "Germany",
+                "city": "Hamburg", 
+                "coordinates": {"lat": 53.5511, "lon": 9.9937},
+                "timezone": "Europe/Berlin"
+            },
+            "bosporus": {
+                "name": "Bosporus",
+                "country": "Turkey",
+                "city": "Istanbul",
+                "coordinates": {"lat": 41.0082, "lon": 28.9784},
+                "timezone": "Europe/Istanbul"
+            },
+            "nhEL83_UPpo": {
+                "name": "Detroit River",
+                "country": "USA",
+                "city": "Detroit",
+                "state": "Michigan",
+                "coordinates": {"lat": 42.3314, "lon": -83.0458},
+                "timezone": "America/Detroit"
+            }
+        }
+        
+        # Determine camera location for this URL
+        self.camera_info = self.get_camera_location(self.url)
+        
         # Statistics
         self.stats = {
             'frames_processed': 0,
@@ -52,6 +103,32 @@ class IntelligentYouTubeBoatScraper:
         print(f"✓ Base output directory: {self.base_dir}")
         print(f"✓ Files will be organized by: YEAR/MONTH/DAY/HOUR/")
         print(f"✓ YouTube URL: {self.url}")
+        if self.camera_info:
+            print(f"✓ Camera Location: {self.camera_info['name']}, {self.camera_info['country']}")
+        else:
+            print(f"⚠ Camera location unknown for this URL")
+    
+    def get_camera_location(self, url):
+        """Determine camera location based on URL"""
+        try:
+            # Check each known camera identifier
+            for identifier, location_info in self.camera_locations.items():
+                if identifier in url:
+                    return location_info
+            
+            # If no match found, return unknown location
+            return {
+                "name": "Unknown Camera",
+                "country": "Unknown",
+                "city": "Unknown",
+                "coordinates": {"lat": None, "lon": None},
+                "timezone": "UTC",
+                "url": url
+            }
+            
+        except Exception as e:
+            print(f"⚠ Error determining camera location: {e}")
+            return None
     
     def setup_driver(self):
         """Setup Chrome driver optimized for speed"""
@@ -83,8 +160,6 @@ class IntelligentYouTubeBoatScraper:
             
             # IMPROVED CACHING LOGIC
             service = None
-            
-       
             
             # Method 2: Find cached ChromeDriver (FIXED PATHS)
             if service is None:
@@ -358,6 +433,14 @@ class IntelligentYouTubeBoatScraper:
                     "y2": bbox[3],
                     "width": bbox[2] - bbox[0],
                     "height": bbox[3] - bbox[1]
+                },
+                "camera_location": self.camera_info if self.camera_info else {
+                    "name": "Unknown Camera",
+                    "country": "Unknown",
+                    "city": "Unknown",
+                    "coordinates": {"lat": None, "lon": None},
+                    "timezone": "UTC",
+                    "url": self.url
                 },
                 "frame_info": {
                     "frame_width": frame.shape[1],
