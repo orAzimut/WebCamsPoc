@@ -1,23 +1,28 @@
+import yaml
+import os
 from youtube_scraper import IntelligentYouTubeBoatScraper
 
 def main():
     print("🚢 INTELLIGENT YOUTUBE BOAT DETECTION SCRAPER (YOLO TRACKING)")
     print("=" * 60)
     
-    # Get YouTube URL
-    youtube_url = input("Enter YouTube URL: ").strip()
-    if not youtube_url:
-        print("❌ No URL provided")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_file = os.path.join(script_dir, "..", "resources", "config.yaml")
+    try:
+        with open(config_file, 'r') as f:
+            config = yaml.safe_load(f)
+    except Exception as e:
+        print(f"❌ Error reading config.yaml: {e}")
         return
     
-    # Ask about headless mode
-    headless_choice = input("\nRun in background (invisible browser)? (y/n): ").strip().lower()
-    headless = headless_choice == 'y'
+    youtube_url = config['youtube_url'].strip()
+    headless = config['headless']
     
+    print(f"📺 YouTube URL: {youtube_url}")
     if headless:
-        print("🔧 Will run in background mode (invisible browser)")
+        print("🔧 Running in background mode (invisible browser)")
     else:
-        print("🔧 Will run with visible browser")
+        print("🔧 Running with visible browser")
     
     # Create scraper instance
     scraper = IntelligentYouTubeBoatScraper(youtube_url, headless=headless)
