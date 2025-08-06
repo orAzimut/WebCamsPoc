@@ -21,7 +21,7 @@ class YOLOBoatDetector:
                 print(f"✗ Model file not found at: {model_path}")
                 # Fallback to auto-download
                 print("Trying auto-download instead...")
-                self.model = YOLO('yolo11n.pt')  # This will download automatically
+                self.model = YOLO('yolo11l.pt')  # This will download automatically
             else:
                 print(f"✓ Found existing model at: {model_path}")
                 self.model = YOLO(model_path)
