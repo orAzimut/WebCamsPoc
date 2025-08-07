@@ -1,0 +1,33 @@
+# Core dependencies
+opencv-python-headless==4.8.1.78
+opencv-contrib-python-headless==4.8.1.78  # Additional OpenCV modules with CUDA support
+numpy==1.24.3
+PyYAML==6.0.1
+
+# Google Cloud
+google-cloud-storage==2.10.0
+
+# deep-learning stack ───────────────
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121 
+
+# yolo / cv stack
+ultralytics>=8.3.0
+opencv-python-headless==4.8.1.78
+# Web scraping
+selenium==4.15.2
+webdriver-manager==4.0.1
+
+# Additional utilities
+Pillow==10.0.1
+requests==2.31.0
+
+# CUDA-aware additional packages
+cupy-cuda12x>=12.0.0  # CUDA-accelerated NumPy alternative (optional but recommended)
+numba>=0.58.0         # JIT compiler with CUDA support
+
+# Optional: Additional ML packages that benefit from GPU
+# scipy==1.11.4
+# scikit-image==0.21.0
+# matplotlib==3.7.2  # For visualization if needed
