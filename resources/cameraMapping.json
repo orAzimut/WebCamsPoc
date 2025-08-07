@@ -1,0 +1,64 @@
+{
+    "_KVWehizoNU": {
+      "name": "Rotterdam Port 2",
+      "country": "Netherlands",
+      "city": "Rotterdam",
+      "coordinates": {
+        "lat": 51.9244,
+        "lon": 4.4777
+      },
+      "timezone": "Europe/Amsterdam"
+    },
+    "port-of-newcastle-cam": {
+      "name": "Newcastle Port",
+      "country": "Australia",
+      "city": "Newcastle",
+      "state": "New South Wales",
+      "coordinates": {
+        "lat": -32.9273,
+        "lon": 151.7817
+      },
+      "timezone": "Australia/Sydney"
+    },
+    "oxx7MqjhOpw": {
+      "name": "Dublin Port Bay",
+      "country": "Ireland",
+      "city": "Dublin",
+      "coordinates": {
+        "lat": 53.3498,
+        "lon": -6.2603
+      },
+      "timezone": "Europe/Dublin"
+    },
+    "nmic4tt88-Y": {
+      "name": "Hamburg Port 1",
+      "country": "Germany",
+      "city": "Hamburg",
+      "coordinates": {
+        "lat": 53.5511,
+        "lon": 9.9937
+      },
+      "timezone": "Europe/Berlin"
+    },
+    "bosporus": {
+      "name": "Bosporus",
+      "country": "Turkey",
+      "city": "Istanbul",
+      "coordinates": {
+        "lat": 41.0082,
+        "lon": 28.9784
+      },
+      "timezone": "Europe/Istanbul"
+    },
+    "nhEL83_UPpo": {
+      "name": "Detroit River",
+      "country": "USA",
+      "city": "Detroit",
+      "state": "Michigan",
+      "coordinates": {
+        "lat": 42.3314,
+        "lon": -83.0458
+      },
+      "timezone": "America/Detroit"
+    }
+  }
