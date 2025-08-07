@@ -1,0 +1,101 @@
+# CPU-only fallback Dockerfile
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
+    DISPLAY=:99
+
+# Install system dependencies including Chrome
+RUN apt-get update && apt-get install -y \
+    # Chrome dependencies
+    wget \
+    gnupg \
+    unzip \
+    curl \
+    xvfb \
+    # OpenCV dependencies
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libgoogle-perftools4 \
+    # Additional OpenCV dependencies
+    libgtk-3-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libv4l-dev \
+    libxvidcore-dev \
+    libx264-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libtiff-dev \
+    libatlas-base-dev \
+    gfortran \
+    # Additional system tools
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add Google Chrome repository and install Chrome
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy requirements for CPU-only installation
+COPY requirements-cpu.txt .
+
+# Install Python dependencies (CPU versions)
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements-cpu.txt
+
+# Verify installation
+RUN python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'CPU-only mode: {not torch.cuda.is_available()}')"
+
+# Create necessary directories
+RUN mkdir -p /app/src /app/resources /app/data
+
+# Copy project files
+COPY src/ /app/src/
+COPY resources/ /app/resources/
+
+# Extract chromedriver if it exists as zip
+RUN if [ -f /app/resources/chromedriver.zip ]; then \
+    cd /app/resources && unzip chromedriver.zip && rm chromedriver.zip; \
+    fi
+
+# Set permissions for chromedriver
+RUN if [ -f /app/resources/chromedriver ]; then \
+    chmod +x /app/resources/chromedriver; \
+    fi
+
+# Set GOOGLE_APPLICATION_CREDENTIALS if credentials exist
+ENV GOOGLE_APPLICATION_CREDENTIALS=/app/resources/credentials.json
+
+# Create a script to start Xvfb and the application
+RUN echo '#!/bin/bash\n\
+echo "=== RUNNING IN CPU-ONLY MODE ==="\n\
+python -c "import torch; print(f\"PyTorch CPU mode: {not torch.cuda.is_available()}\")" 2>/dev/null || echo "PyTorch not ready yet"\n\
+echo "==============================="\n\
+# Start Xvfb for headless GUI apps\n\
+Xvfb :99 -screen 0 1920x1080x24 &\n\
+# Wait a moment for Xvfb to start\n\
+sleep 2\n\
+# Run the Python application\n\
+cd /app/src\n\
+python main.py\n' > /app/start.sh \
+    && chmod +x /app/start.sh
+
+# Set working directory to src for the main script
+WORKDIR /app/src
+
+# Default command
+CMD ["/app/start.sh"]

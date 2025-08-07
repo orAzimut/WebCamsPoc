@@ -10,7 +10,8 @@ class BoatTracker:
         self.last_save_times = {}       # boat_id -> last save timestamp
         self.save_counts = {}           # boat_id -> number of saves
         self.boat_features = {}         # boat_id -> dict of features from last save
-        
+        self.first_detection_times = {}  # Add this
+        self.first_detection_frames = {}  # Add this
         # Configuration - purely content-based filtering
         
         # More restrictive thresholds

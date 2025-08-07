@@ -3,7 +3,7 @@ import os
 from youtube_scraper import IntelligentYouTubeBoatScraper
 
 def main():
-    print("🚢 INTELLIGENT YOUTUBE BOAT DETECTION SCRAPER (YOLO TRACKING + GCS)")
+    print("🚢 INTELLIGENT json YOUTUBE BOAT DETECTION SCRAPER (YOLO TRACKING + GCS) ")
     print("=" * 60)
     
     # Load configuration

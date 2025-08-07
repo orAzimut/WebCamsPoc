@@ -14,7 +14,7 @@ class YOLOBoatDetector:
             print("🔥 Loading YOLO11 model...")
             
             # Use your existing model file
-            model_path = r"C:\Users\OrGil.AzureAD\OneDrive - AMPC\Desktop\Azimut.ai\webScrape\webCams\POC\yolo11n.pt"
+            model_path = r"/app/models/yolo11n.pt"
             
             # Check if file exists
             if not os.path.exists(model_path):

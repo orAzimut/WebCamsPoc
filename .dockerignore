@@ -1,0 +1,69 @@
+# Git files
+.git
+.gitignore
+README.md
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (don't include these in context)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Data directories (will be mounted)
+data/
+output/
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+
+
+
+# Keep important resources
+!resources/chromedriver.zip
+!resources/credentials.json
+!resources/config.yaml
+!resources/cameraMapping.json

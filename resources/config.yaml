@@ -1,2 +1,20 @@
-youtube_url: "https://www.youtube.com/watch?v=nmic4tt88-Y"
-headless: true
+# YouTube Configuration
+youtube_url: "https://www.youtube.com/watch?v=_KVWehizoNU"  # Rotterdam Port example
+headless: True  # Set to true for background mode
+
+# Storage Configuration
+use_gcs: true  # Set to true to use Google Cloud Storage, false for local storage
+
+# GCS Configuration (only used if use_gcs is true)
+gcs:
+  bucket_name: "outsource_data"
+  credentials_path: "../resources/credentials.json"  # Relative path from scripts folder
+
+# Camera URLs (for reference)
+camera_urls:
+  rotterdam_port_2: "https://www.youtube.com/watch?v=_KVWehizoNU"
+  newcastle_port: "https://www.youtube.com/watch?v=port-of-newcastle-cam"
+  dublin_port_bay: "https://www.youtube.com/watch?v=oxx7MqjhOpw"
+  hamburg_port_1: "https://www.youtube.com/watch?v=nmic4tt88-Y"
+  bosporus: "https://www.youtube.com/watch?v=bosporus"
+  detroit_river: "https://www.youtube.com/watch?v=nhEL83_UPpo"

@@ -1,5 +1,7 @@
 import time
 import os
+import uuid
+import hashlib
 import cv2
 import numpy as np
 import json
@@ -12,6 +14,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver import Remote
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from webdriver_manager.chrome import ChromeDriverManager
 import math
 from collections import defaultdict
@@ -216,42 +220,45 @@ class IntelligentYouTubeBoatScraper:
             return None
     
     def setup_driver(self):
-        """Setup Chrome driver optimized for speed"""
+        """Setup Chrome driver - either remote (Docker) or local"""
         try:
+            # Check if we should use remote Selenium (in Docker)
+            use_remote = os.environ.get('USE_REMOTE_SELENIUM', 'false').lower() == 'true'
+            selenium_url = os.environ.get('SELENIUM_REMOTE_URL', 'http://localhost:4444/wd/hub')
+            
             mode_text = "headless" if self.headless else "visible"
-            print(f"⚡ Setting up Chrome driver ({mode_text} mode)...")
+            
+            if use_remote:
+                print(f"⚡ Connecting to remote Chrome ({mode_text} mode)...")
+                print(f"🌐 Selenium Grid URL: {selenium_url}")
+            else:
+                print(f"⚡ Setting up local Chrome driver ({mode_text} mode)...")
+            
             start_time = time.time()
             
+            # Setup Chrome options
             chrome_options = Options()
             
-            # Headless mode option - ENHANCED FOR VIDEO STREAMING
+            # Headless mode options
             if self.headless:
-                # Use new headless mode for better compatibility
-                chrome_options.add_argument("--headless=new")  # New headless mode
+                chrome_options.add_argument("--headless=new")
                 chrome_options.add_argument("--disable-gpu")
                 chrome_options.add_argument("--disable-software-rasterizer")
                 chrome_options.add_argument("--disable-dev-shm-usage")
                 chrome_options.add_argument("--no-sandbox")
-                
-                # Force larger window size for better video rendering
                 chrome_options.add_argument("--window-size=1920,1080")
                 chrome_options.add_argument("--start-maximized")
-                
-                # Additional flags for video playback in headless
                 chrome_options.add_argument("--use-fake-ui-for-media-stream")
                 chrome_options.add_argument("--use-fake-device-for-media-stream")
                 chrome_options.add_argument("--autoplay-policy=no-user-gesture-required")
-                
-                # Disable throttling that affects headless mode
                 chrome_options.add_argument("--disable-background-timer-throttling")
                 chrome_options.add_argument("--disable-backgrounding-occluded-windows")
                 chrome_options.add_argument("--disable-renderer-backgrounding")
                 chrome_options.add_argument("--disable-features=TranslateUI")
                 chrome_options.add_argument("--disable-ipc-flooding-protection")
-                
                 print("👻 Running in headless mode with video optimization")
             else:
-                chrome_options.add_argument("--window-size=1280,720")
+                chrome_options.add_argument("--window-size=1920,1080")
             
             # Common options for both modes
             chrome_options.add_argument("--disable-blink-features=AutomationControlled")
@@ -259,8 +266,6 @@ class IntelligentYouTubeBoatScraper:
             chrome_options.add_experimental_option('useAutomationExtension', False)
             chrome_options.add_argument("--disable-extensions")
             chrome_options.add_argument("--autoplay-policy=no-user-gesture-required")
-            
-            # User agent to appear more like a real browser
             chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
             
             prefs = {
@@ -273,49 +278,98 @@ class IntelligentYouTubeBoatScraper:
             }
             chrome_options.add_experimental_option("prefs", prefs)
             
-            # IMPROVED CACHING LOGIC
-            service = None
-            
-            # Method 2: Find cached ChromeDriver
-            if service is None:
+            # Create driver - Remote or Local
+            if use_remote:
+                # Import for remote driver
+                from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+                from selenium.webdriver import Remote
+                
+                # Try to connect with retries
+                max_retries = 5
+                retry_delay = 5
+                
+                for attempt in range(max_retries):
+                    try:
+                        print(f"🔄 Connection attempt {attempt + 1}/{max_retries}...")
+                        
+                        self.driver = Remote(
+                            command_executor=selenium_url,
+                            options=chrome_options
+                        )
+                        
+                        # Test the connection
+                        self.driver.execute_script("return navigator.userAgent")
+                        print(f"✅ Connected to remote Chrome successfully!")
+                        break
+                        
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            print(f"⚠️ Connection failed: {e}")
+                            print(f"⏳ Retrying in {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                        else:
+                            raise Exception(f"Failed to connect to Selenium Grid after {max_retries} attempts: {e}")
+            else:
+                # Local driver (original code)
+                service = None
+                
+                # Try to find cached ChromeDriver
                 try:
                     import glob
                     cache_locations = [
                         r"C:\Users\OrGil.AzureAD\.wdm\drivers\chromedriver\win64\*\chromedriver-win32\chromedriver.exe",
                         os.path.expanduser(r"~\.wdm\drivers\chromedriver\win64\*\chromedriver-win32\chromedriver.exe"),
-                        os.path.expanduser(r"~\.wdm\drivers\chromedriver\win64\*\chromedriver.exe")
+                        os.path.expanduser(r"~\.wdm\drivers\chromedriver\win64\*\chromedriver.exe"),
+                        # Add Linux paths for Docker (though this won't be used in remote mode)
+                        "/usr/local/bin/chromedriver",
+                        "/usr/bin/chromedriver"
                     ]
                     
                     print("🔍 Checking cache locations:")
                     for location in cache_locations:
+                        if os.path.exists(location):
+                            service = Service(location)
+                            print(f"✅ Using cached ChromeDriver: {location}")
+                            break
+                        
                         cached_files = glob.glob(location)
                         if cached_files:
                             cached_path = max(cached_files, key=os.path.getmtime)
                             service = Service(cached_path)
-                            version = cached_path.split("\\")[-3]
+                            version = cached_path.split(os.sep)[-3] if os.sep in cached_path else "unknown"
                             print(f"✅ Using cached ChromeDriver v{version}")
                             break
                 except Exception as e:
                     print(f"⚠️ Cache search error: {e}")
+                
+                # Download if not found
+                if service is None:
+                    print("📥 No cached driver found, downloading...")
+                    from webdriver_manager.chrome import ChromeDriverManager
+                    driver_path = ChromeDriverManager().install()
+                    service = Service(driver_path)
+                    print(f"💾 Driver downloaded to: {driver_path}")
+                
+                # Create local driver
+                self.driver = webdriver.Chrome(service=service, options=chrome_options)
             
-            # Method 3: Download if not found
-            if service is None:
-                print("📥 No cached driver found, downloading...")
-                from webdriver_manager.chrome import ChromeDriverManager
-                driver_path = ChromeDriverManager().install()
-                service = Service(driver_path)
-                print(f"💾 Driver downloaded to: {driver_path}")
-            
-            # Create driver
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            # Apply stealth settings
             self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
             setup_time = time.time() - start_time
             print(f"✅ Chrome driver ready in {setup_time:.1f}s")
+            
+            # If using remote and not headless, provide VNC info
+            if use_remote and not self.headless:
+                print(f"👁️ You can view the browser at: http://localhost:7900")
+                print(f"🔑 VNC Password: secret (if required)")
+            
             return True
             
         except Exception as e:
             print(f"❌ Failed to initialize Chrome driver: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def load_youtube_video(self):
@@ -569,25 +623,25 @@ class IntelligentYouTubeBoatScraper:
             print(f"❌ Error capturing video frame: {e}")
             return None
     
-    def create_gcs_paths(self):
-        """Create GCS paths for image and JSON storage"""
+    def create_gcs_paths_with_uuid(self, boat_uuid):
+        """Create GCS paths with UUID folder structure"""
         now = datetime.now()
         
-        # Get camera location name (replace spaces with underscores)
+        # Get camera location name
         location_name = self.camera_info['name'] if self.camera_info else 'Unknown_Camera'
         
-        # Create year/month/day/hour structure
+        # Create year/month/day/hour/UUID structure
         year = now.strftime("%Y")
         month = now.strftime("%m") 
         day = now.strftime("%d")
         hour = now.strftime("%H")
         
-        # Build GCS paths
-        image_path = f"reidentification/bronze/raw_crops/webCams/{location_name}/{year}/{month}/{day}/{hour}"
-        json_path = f"reidentification/bronze/json_lables/webCams/{location_name}/{year}/{month}/{day}/{hour}"
+        # Build GCS paths with UUID folder
+        image_path = f"reidentification/bronze/raw_crops/webCams/{location_name}/{year}/{month}/{day}/{hour}/{boat_uuid}"
+        json_path = f"reidentification/bronze/json_lables/webCams/{location_name}/{year}/{month}/{day}/{hour}/{boat_uuid}"
         
         return image_path, json_path
-    
+        
     def upload_to_gcs(self, blob_name, data, content_type='application/octet-stream'):
         """Upload data to Google Cloud Storage"""
         try:
@@ -613,9 +667,19 @@ class IntelligentYouTubeBoatScraper:
             print(f"❌ GCS upload failed: {e}")
             self.stats['gcs_failures'] += 1
             return False
+    def generate_boat_uuid(self, boat_id, camera_name):
+        """Generate consistent UUID for a boat based on boat_id and camera"""
+        # Create a unique string for this boat at this camera
+        unique_string = f"{camera_name}_{boat_id}_{self.run_timestamp}"
+        
+        # Generate UUID from hash
+        hash_object = hashlib.md5(unique_string.encode())
+        boat_uuid = str(uuid.UUID(hash_object.hexdigest()))
+        
+        return boat_uuid
     
     def save_boat_image(self, boat_image, boat_detection, current_time):
-        """Save individual cropped boat image with clean JSON metadata"""
+        """Save individual cropped boat image with company-standard JSON metadata"""
         try:
             boat_id = boat_detection['track_id']
             
@@ -624,46 +688,157 @@ class IntelligentYouTubeBoatScraper:
                 print(f"  ⚠️ Invalid boat image for boat {boat_id}")
                 return False
             
-            # Create filename (same for both image and JSON)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            base_filename = f"boat_{boat_id:03d}_{timestamp}_{self.stats['images_saved']:04d}"
+            # Generate consistent UUID for this boat
+            camera_name = self.camera_info['name'] if self.camera_info else 'Unknown_Camera'
+            boat_uuid = self.generate_boat_uuid(boat_id, camera_name)
             
-            # Create metadata
+            # Create filename (same for both image and JSON)
+            timestamp = datetime.now()
+            timestamp_str = timestamp.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            base_filename = f"boat_{boat_id:03d}_{timestamp_str}_{self.stats['images_saved']:04d}"
+            
+            # Extract bounding box info
+            bbox = boat_detection.get('bbox', [0, 0, 0, 0])
+            if len(bbox) == 4:
+                if bbox[2] > boat_image.shape[1] or bbox[3] > boat_image.shape[0]:
+                    # Format: x, y, width, height
+                    x1, y1, w, h = bbox
+                    x2, y2 = x1 + w, y1 + h
+                else:
+                    # Format: x1, y1, x2, y2
+                    x1, y1, x2, y2 = bbox
+            else:
+                x1, y1, x2, y2 = 0, 0, 0, 0
+            
+            # Create company-standard metadata
             metadata = {
-                "timestamp": timestamp,
-                "youtube_url": self.url,
-                "boat_id": boat_id,
-                "confidence": round(boat_detection['confidence'], 3),
-                "class": boat_detection['class'],
-                "cropped_image_info": {
-                    "width": boat_image.shape[1],
-                    "height": boat_image.shape[0],
-                    "channels": boat_image.shape[2] if len(boat_image.shape) == 3 else 1,
-                    "note": "This JSON corresponds to a cropped boat image"
+                "target": {
+                    "SOURCE": camera_name,
+                    "TYPE": "EO",  # Electro-Optical (video camera)
+                    "FIRST_DETECTION": self.simple_tracker.first_detection_times.get(boat_id, current_time),
+                    "last_update_time": current_time,
+                    "ID": boat_id,
+                    "uuid": boat_uuid,
+                    "tracker_ID": boat_id,
+                    "threat_level": "UNKNOWN",
+                    "quality": None,  # Default quality score
+                    "is_child": False,
+                    "state": "Observing",
+                    "current_coordinate": [
+                        self.camera_info['coordinates']['lon'] if self.camera_info else None,
+                        self.camera_info['coordinates']['lat'] if self.camera_info else None
+                    ],
+                    "long_term_history": [],  # Would need to track this over time
+                    "speed": None,  # Cannot determine from static detection
+                    "course": None,  # Cannot determine from static detection
+                    "distance_from_platform": None,  # Would need camera calibration
+                    "max_distance_from_platform": None,
+                    "aspect": None,
+                    "size_m": None,  # Would need camera calibration and distance
+                    "alerts": [],
+                    "classification": boat_detection.get('class_name', 'boat'),
+                    "identification": boat_detection.get('class_name', 'boat'),
+                    "bounding_box": {
+                        "bounding_box": [int(x1), int(y1), int(x2), int(y2)],
+                        "padded_bounding_box": [
+                            max(0, int(x1) - 50),
+                            max(0, int(y1) - 50),
+                            min(boat_image.shape[1], int(x2) + 50),
+                            min(boat_image.shape[0], int(y2) + 50)
+                        ],
+                        "identification": boat_detection.get('class_name', 'boat'),
+                        "conf": float(boat_detection.get('confidence', 0.0)),
+                        "id": boat_id,
+                        "image": None,  # We save images separately
+                        "frame_count": self.stats['frames_processed'],
+                        "start_frame": self.simple_tracker.first_detection_frames.get(boat_id, 0),
+                        "end_frame": self.stats['frames_processed'],
+                        "reid_count": self.simple_tracker.get_save_count(boat_id),
+                        "is_static": None,
+                        "emb_dist": None,
+                        "smooth_mean": None,
+                        "smooth_embedding_update": None
+                    },
+                    "frame_number": self.stats['frames_processed'],
+                    "MMSI": None,  # Maritime Mobile Service Identity - not available
+                    "IMO": None,  # International Maritime Organization number - not available
+                    "SHIP_TYPE": None,
+                    "NAME": None,
+                    "CALL_SIGN": None,
+                    "DIMENSIONS": None,
+                    "add_counter": None,
+                    "delete_counter": None,
+                    "uncertainty_area": [],
+                    "children": [],
+                    "manual_not_suspicious": False,
+                    "manual_not_suspicious_for_db": False
                 },
-                "camera_location": self.camera_info if self.camera_info else {
-                    "name": "Unknown_Camera",
-                    "country": "Unknown",
-                    "city": "Unknown",
-                    "coordinates": {"lat": None, "lon": None},
-                    "timezone": "UTC",
-                    "url": self.url
+                "IMO": None,
+                "platform": {
+                    "platform_name": camera_name,
+                    "platform_type": "webcam",
+                    "location": {
+                        "latitude": self.camera_info['coordinates']['lat'] if self.camera_info else None,
+                        "longitude": self.camera_info['coordinates']['lon'] if self.camera_info else None,
+                        "altitude": None
+                    },
+                    "attitude": {
+                        "yaw": None,
+                        "roll": None,
+                        "pitch": None
+                    },
+                    "is_flying": False,  # Static webcam
+                    "remote_location": {
+                        "latitude": None,
+                        "longitude": None
+                    },
+                    "simulator_data": None,
+                    "camera_data": {
+                        "gimbal": {
+                            "pitch": None,
+                            "yaw": None,
+                            "roll": None
+                        },
+                        "gimbal_q": {},
+                        "gimbal_j": {},
+                        "focal_lengths": {
+                            "zoom": None
+                        },
+                        "zoom_limits": {
+                            "zoom": None
+                        },
+                        "focal_length_limits": {
+                            "zoom": None
+                        },
+                        "fov_polygons": {
+                            "zoom": None
+                        },
+                        "real_data_received": True,
+                        "center_point": [
+                            None
+                        ],
+                        "horizon_offset": {
+                            "zoom": None
+                        },
+                        "horizon_line_list": None
+                    },
+                    "frame_metadata": {
+                        "stream_url": self.url,
+                        "extraction_timestamp": timestamp_str,
+                        "cropped_image_dimensions": {
+                            "width": boat_image.shape[1],
+                            "height": boat_image.shape[0]
+                        }
+                    }
                 },
-                "datetime_path": {
-                    "year": datetime.now().strftime("%Y"),
-                    "month": datetime.now().strftime("%m"),
-                    "day": datetime.now().strftime("%d"), 
-                    "hour": datetime.now().strftime("%H")
-                },
-                "tracking_info": {
-                    "save_count_for_this_boat": self.simple_tracker.get_save_count(boat_id) + 1,
-                    "time_since_last_save": current_time - self.simple_tracker.last_save_times.get(boat_id, 0)
-                }
+                "uuid": boat_uuid,
+                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": timestamp.strftime("%Y-%m-%d %H:%M:%S")
             }
             
             if self.use_gcs:
-                # Save to Google Cloud Storage
-                image_path, json_path = self.create_gcs_paths()
+                # Save to Google Cloud Storage with UUID folder structure
+                image_path, json_path = self.create_gcs_paths_with_uuid(boat_uuid)
                 
                 # Upload image
                 image_blob_name = f"{image_path}/{base_filename}.jpg"
@@ -673,8 +848,7 @@ class IntelligentYouTubeBoatScraper:
                         print(f"☁️ Uploaded image: {image_blob_name}")
                     else:
                         print(f"❌ Failed to upload image to GCS")
-                        # Fallback to local
-                        self.save_local_fallback(boat_image, metadata, base_filename)
+                        self.save_local_fallback_with_uuid(boat_image, metadata, base_filename, boat_uuid)
                         return False
                 
                 # Upload JSON
@@ -686,14 +860,19 @@ class IntelligentYouTubeBoatScraper:
                     print(f"❌ Failed to upload JSON to GCS")
                     return False
                 
-                print(f"💾 Saved boat {boat_id} to GCS")
+                print(f"💾 Saved boat {boat_id} (UUID: {boat_uuid[:8]}...) to GCS")
                 print(f"   📐 Size: {boat_image.shape[1]}x{boat_image.shape[0]} pixels")
                 print(f"   ☁️ Location: {self.camera_info['name'] if self.camera_info else 'Unknown'}")
                 print(f"   📊 Save #{self.simple_tracker.get_save_count(boat_id) + 1} for boat {boat_id}")
                 
             else:
-                # Save locally (original behavior)
-                self.save_local_fallback(boat_image, metadata, base_filename)
+                # Save locally with UUID folder structure
+                self.save_local_fallback_with_uuid(boat_image, metadata, base_filename, boat_uuid)
+            
+            # Track first detection time and frame if new boat
+            if boat_id not in self.simple_tracker.first_detection_times:
+                self.simple_tracker.first_detection_times[boat_id] = current_time
+                self.simple_tracker.first_detection_frames[boat_id] = self.stats['frames_processed']
             
             # Update tracker and statistics
             self.simple_tracker.record_save(boat_id, current_time)
@@ -705,33 +884,8 @@ class IntelligentYouTubeBoatScraper:
         except Exception as e:
             print(f"❌ Error saving boat image: {e}")
             return False
-    
-    def save_local_fallback(self, boat_image, metadata, base_filename):
-        """Save to local storage as fallback"""
-        try:
-            # Create datetime-based folder structure locally
-            now = datetime.now()
-            year = now.strftime("%Y")
-            month = now.strftime("%m") 
-            day = now.strftime("%d")
-            hour = now.strftime("%H")
-            
-            datetime_folder = os.path.join(self.base_dir, year, month, day, hour)
-            os.makedirs(datetime_folder, exist_ok=True)
-            
-            # Save image locally
-            image_filepath = os.path.join(datetime_folder, f"{base_filename}.jpg")
-            cv2.imwrite(image_filepath, boat_image)
-            
-            # Save JSON locally
-            json_filepath = os.path.join(datetime_folder, f"{base_filename}.json")
-            with open(json_filepath, 'w') as f:
-                json.dump(metadata, f, indent=2)
-            
-            print(f"💾 Saved locally (fallback): {base_filename}")
-            
-        except Exception as e:
-            print(f"❌ Local save also failed: {e}")
+        
+   
     
     def process_frame(self, current_time, frame_count):
         """Process single frame for boat detection using YOLO tracking"""
